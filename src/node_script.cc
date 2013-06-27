@@ -21,27 +21,28 @@
 
 #include "node.h"
 #include "node_script.h"
+#include "node_watchdog.h"
 #include <assert.h>
 
 namespace node {
 
-using v8::Context;
-using v8::Script;
-using v8::Value;
-using v8::Handle;
-using v8::HandleScope;
-using v8::Object;
 using v8::Arguments;
-using v8::ThrowException;
-using v8::TryCatch;
-using v8::String;
-using v8::Exception;
-using v8::Local;
 using v8::Array;
-using v8::Persistent;
-using v8::Integer;
+using v8::Context;
+using v8::Exception;
 using v8::Function;
 using v8::FunctionTemplate;
+using v8::Handle;
+using v8::HandleScope;
+using v8::Local;
+using v8::Object;
+using v8::Persistent;
+using v8::Script;
+using v8::String;
+using v8::ThrowException;
+using v8::TryCatch;
+using v8::V8;
+using v8::Value;
 
 
 class WrappedContext : ObjectWrap {
@@ -74,10 +75,12 @@ class WrappedScript : ObjectWrap {
   enum EvalInputFlags { compileCode, unwrapExternal };
   enum EvalContextFlags { thisContext, newContext, userContext };
   enum EvalOutputFlags { returnResult, wrapExternal };
+  enum EvalTimeoutFlags { noTimeout, useTimeout };
 
   template <EvalInputFlags input_flag,
             EvalContextFlags context_flag,
-            EvalOutputFlags output_flag>
+            EvalOutputFlags output_flag,
+            EvalTimeoutFlags timeout_flag>
   static Handle<Value> EvalMachine(const Arguments& args);
 
  protected:
@@ -103,7 +106,7 @@ Persistent<Function> cloneObjectMethod;
 
 void CloneObject(Handle<Object> recv,
                  Handle<Value> source, Handle<Value> target) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   Handle<Value> args[] = {source, target};
 
@@ -124,7 +127,8 @@ void CloneObject(Handle<Object> recv,
         })"
       ), String::New("binding:script"))->Run()
     );
-    cloneObjectMethod = Persistent<Function>::New(cloneObjectMethod_);
+    cloneObjectMethod = Persistent<Function>::New(node_isolate,
+                                                  cloneObjectMethod_);
   }
 
   cloneObjectMethod->Call(recv, 2, args);
@@ -132,10 +136,10 @@ void CloneObject(Handle<Object> recv,
 
 
 void WrappedContext::Initialize(Handle<Object> target) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   Local<FunctionTemplate> t = FunctionTemplate::New(WrappedContext::New);
-  constructor_template = Persistent<FunctionTemplate>::New(t);
+  constructor_template = Persistent<FunctionTemplate>::New(node_isolate, t);
   constructor_template->InstanceTemplate()->SetInternalFieldCount(1);
   constructor_template->SetClassName(String::NewSymbol("Context"));
 
@@ -150,7 +154,7 @@ bool WrappedContext::InstanceOf(Handle<Value> value) {
 
 
 Handle<Value> WrappedContext::New(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   WrappedContext *t = new WrappedContext();
   t->Wrap(args.This());
@@ -160,12 +164,12 @@ Handle<Value> WrappedContext::New(const Arguments& args) {
 
 
 WrappedContext::WrappedContext() : ObjectWrap() {
-  context_ = Context::New();
+  context_ = Persistent<Context>::New(node_isolate, Context::New(node_isolate));
 }
 
 
 WrappedContext::~WrappedContext() {
-  context_.Dispose();
+  context_.Dispose(node_isolate);
 }
 
 
@@ -184,10 +188,10 @@ Persistent<FunctionTemplate> WrappedScript::constructor_template;
 
 
 void WrappedScript::Initialize(Handle<Object> target) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   Local<FunctionTemplate> t = FunctionTemplate::New(WrappedScript::New);
-  constructor_template = Persistent<FunctionTemplate>::New(t);
+  constructor_template = Persistent<FunctionTemplate>::New(node_isolate, t);
   constructor_template->InstanceTemplate()->SetInternalFieldCount(1);
   // Note: We use 'NodeScript' instead of 'Script' so that we do not
   // conflict with V8's Script class defined in v8/src/messages.js
@@ -236,23 +240,24 @@ Handle<Value> WrappedScript::New(const Arguments& args) {
     return FromConstructorTemplate(constructor_template, args);
   }
 
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   WrappedScript *t = new WrappedScript();
-  t->Wrap(args.Holder());
+  t->Wrap(args.This());
 
   return
-    WrappedScript::EvalMachine<compileCode, thisContext, wrapExternal>(args);
+    WrappedScript::EvalMachine<
+      compileCode, thisContext, wrapExternal, noTimeout>(args);
 }
 
 
 WrappedScript::~WrappedScript() {
-  script_.Dispose();
+  script_.Dispose(node_isolate);
 }
 
 
 Handle<Value> WrappedScript::CreateContext(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   Local<Object> context = WrappedContext::NewInstance();
 
@@ -274,45 +279,52 @@ Handle<Value> WrappedScript::CreateContext(const Arguments& args) {
 
 Handle<Value> WrappedScript::RunInContext(const Arguments& args) {
   return
-    WrappedScript::EvalMachine<unwrapExternal, userContext, returnResult>(args);
+    WrappedScript::EvalMachine<
+      unwrapExternal, userContext, returnResult, useTimeout>(args);
 }
 
 
 Handle<Value> WrappedScript::RunInThisContext(const Arguments& args) {
   return
-    WrappedScript::EvalMachine<unwrapExternal, thisContext, returnResult>(args);
+    WrappedScript::EvalMachine<
+      unwrapExternal, thisContext, returnResult, useTimeout>(args);
 }
 
 
 Handle<Value> WrappedScript::RunInNewContext(const Arguments& args) {
   return
-    WrappedScript::EvalMachine<unwrapExternal, newContext, returnResult>(args);
+    WrappedScript::EvalMachine<
+      unwrapExternal, newContext, returnResult, useTimeout>(args);
 }
 
 
 Handle<Value> WrappedScript::CompileRunInContext(const Arguments& args) {
   return
-    WrappedScript::EvalMachine<compileCode, userContext, returnResult>(args);
+    WrappedScript::EvalMachine<
+      compileCode, userContext, returnResult, useTimeout>(args);
 }
 
 
 Handle<Value> WrappedScript::CompileRunInThisContext(const Arguments& args) {
   return
-    WrappedScript::EvalMachine<compileCode, thisContext, returnResult>(args);
+    WrappedScript::EvalMachine<
+      compileCode, thisContext, returnResult, useTimeout>(args);
 }
 
 
 Handle<Value> WrappedScript::CompileRunInNewContext(const Arguments& args) {
   return
-    WrappedScript::EvalMachine<compileCode, newContext, returnResult>(args);
+    WrappedScript::EvalMachine<
+      compileCode, newContext, returnResult, useTimeout>(args);
 }
 
 
 template <WrappedScript::EvalInputFlags input_flag,
           WrappedScript::EvalContextFlags context_flag,
-          WrappedScript::EvalOutputFlags output_flag>
+          WrappedScript::EvalOutputFlags output_flag,
+          WrappedScript::EvalTimeoutFlags timeout_flag>
 Handle<Value> WrappedScript::EvalMachine(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   if (input_flag == compileCode && args.Length() < 1) {
     return ThrowException(Exception::TypeError(
@@ -345,7 +357,18 @@ Handle<Value> WrappedScript::EvalMachine(const Arguments& args) {
                            ? args[filename_index]->ToString()
                            : String::New("evalmachine.<anonymous>");
 
-  const int display_error_index = args.Length() - 1;
+  uint64_t timeout = 0;
+  const int timeout_index = filename_index + 1;
+  if (timeout_flag == useTimeout && args.Length() > timeout_index) {
+    if (!args[timeout_index]->IsUint32()) {
+      return ThrowException(Exception::TypeError(
+            String::New("needs an unsigned integer 'ms' argument.")));
+    }
+    timeout = args[timeout_index]->Uint32Value();
+  }
+
+  const int display_error_index = timeout_index +
+                                  (timeout_flag == noTimeout ? 0 : 1);
   bool display_error = false;
   if (args.Length() > display_error_index &&
       args[display_error_index]->IsBoolean() &&
@@ -358,13 +381,7 @@ Handle<Value> WrappedScript::EvalMachine(const Arguments& args) {
   Local<Array> keys;
   if (context_flag == newContext) {
     // Create the new context
-    // Context::New returns a Persistent<Context>, but we only need it for this
-    // function. Here we grab a temporary handle to the new context, assign it
-    // to a local handle, and then dispose the persistent handle. This ensures
-    // that when this function exits the context will be disposed.
-    Persistent<Context> tmp = Context::New();
-    context = Local<Context>::New(tmp);
-    tmp.Dispose();
+    context = Context::New(node_isolate);
 
   } else if (context_flag == userContext) {
     // Use the passed in context
@@ -384,6 +401,10 @@ Handle<Value> WrappedScript::EvalMachine(const Arguments& args) {
   // Catch errors
   TryCatch try_catch;
 
+  // TryCatch must not be verbose to prevent duplicate logging
+  // of uncaught exceptions (we are rethrowing them)
+  try_catch.SetVerbose(false);
+
   Handle<Value> result;
   Handle<Script> script;
 
@@ -394,13 +415,13 @@ Handle<Value> WrappedScript::EvalMachine(const Arguments& args) {
                                          : Script::New(code, filename);
     if (script.IsEmpty()) {
       // FIXME UGLY HACK TO DISPLAY SYNTAX ERRORS.
-      if (display_error) DisplayExceptionLine(try_catch);
+      if (display_error) DisplayExceptionLine(try_catch.Message());
 
       // Hack because I can't get a proper stacktrace on SyntaxError
       return try_catch.ReThrow();
     }
   } else {
-    WrappedScript *n_script = ObjectWrap::Unwrap<WrappedScript>(args.Holder());
+    WrappedScript *n_script = ObjectWrap::Unwrap<WrappedScript>(args.This());
     if (!n_script) {
       return ThrowException(Exception::Error(
             String::New("Must be called as a method of Script.")));
@@ -415,17 +436,28 @@ Handle<Value> WrappedScript::EvalMachine(const Arguments& args) {
 
 
   if (output_flag == returnResult) {
-    result = script->Run();
+    if (timeout) {
+      Watchdog wd(timeout);
+      result = script->Run();
+    } else {
+      result = script->Run();
+    }
+    if (try_catch.HasCaught() && try_catch.HasTerminated()) {
+      V8::CancelTerminateExecution(args.GetIsolate());
+      return ThrowException(Exception::Error(
+            String::New("Script execution timed out.")));
+    }
     if (result.IsEmpty()) {
+      if (display_error) DisplayExceptionLine(try_catch.Message());
       return try_catch.ReThrow();
     }
   } else {
-    WrappedScript *n_script = ObjectWrap::Unwrap<WrappedScript>(args.Holder());
+    WrappedScript *n_script = ObjectWrap::Unwrap<WrappedScript>(args.This());
     if (!n_script) {
       return ThrowException(Exception::Error(
             String::New("Must be called as a method of Script.")));
     }
-    n_script->script_ = Persistent<Script>::New(script);
+    n_script->script_ = Persistent<Script>::New(node_isolate, script);
     result = args.This();
   }
 
@@ -439,7 +471,7 @@ Handle<Value> WrappedScript::EvalMachine(const Arguments& args) {
 
 
 void InitEvals(Handle<Object> target) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   WrappedContext::Initialize(target);
   WrappedScript::Initialize(target);

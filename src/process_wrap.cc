@@ -21,40 +21,35 @@
 
 #include "node.h"
 #include "handle_wrap.h"
-#include "pipe_wrap.h"
-#include "tty_wrap.h"
-#include "tcp_wrap.h"
-#include "udp_wrap.h"
+#include "node_wrap.h"
 
 #include <string.h>
 #include <stdlib.h>
 
 namespace node {
 
-using v8::Object;
-using v8::Handle;
-using v8::Local;
-using v8::Persistent;
-using v8::Value;
-using v8::HandleScope;
-using v8::FunctionTemplate;
-using v8::String;
-using v8::Array;
-using v8::Number;
-using v8::Function;
-using v8::TryCatch;
-using v8::Context;
 using v8::Arguments;
-using v8::Integer;
+using v8::Array;
 using v8::Exception;
+using v8::Function;
+using v8::FunctionTemplate;
+using v8::Handle;
+using v8::HandleScope;
+using v8::Integer;
+using v8::Local;
+using v8::Number;
+using v8::Object;
+using v8::Persistent;
+using v8::String;
 using v8::ThrowException;
+using v8::Value;
 
 static Persistent<String> onexit_sym;
 
 class ProcessWrap : public HandleWrap {
  public:
   static void Initialize(Handle<Object> target) {
-    HandleScope scope;
+    HandleScope scope(node_isolate);
 
     HandleWrap::Initialize(target);
 
@@ -80,15 +75,19 @@ class ProcessWrap : public HandleWrap {
     // normal function.
     assert(args.IsConstructCall());
 
-    HandleScope scope;
+    HandleScope scope(node_isolate);
     ProcessWrap *wrap = new ProcessWrap(args.This());
     assert(wrap);
 
     return scope.Close(args.This());
   }
 
-  ProcessWrap(Handle<Object> object) : HandleWrap(object, NULL) { }
-  ~ProcessWrap() { }
+  ProcessWrap(Handle<Object> object)
+      : HandleWrap(object, reinterpret_cast<uv_handle_t*>(&process_)) {
+  }
+
+  ~ProcessWrap() {
+  }
 
   static void ParseStdioOptions(Local<Object> js_options,
                                 uv_process_options_t* options) {
@@ -112,21 +111,8 @@ class ProcessWrap : public HandleWrap {
             PipeWrap::Unwrap(stdio
                 ->Get(String::NewSymbol("handle")).As<Object>())->UVHandle());
       } else if (type->Equals(String::NewSymbol("wrap"))) {
-        uv_stream_t* stream = NULL;
-        Local<Value> wrapType = stdio->Get(String::NewSymbol("wrapType"));
-        if (wrapType->Equals(String::NewSymbol("pipe"))) {
-          stream = reinterpret_cast<uv_stream_t*>(PipeWrap::Unwrap(stdio
-              ->Get(String::NewSymbol("handle")).As<Object>())->UVHandle());
-        } else if (wrapType->Equals(String::NewSymbol("tty"))) {
-          stream = reinterpret_cast<uv_stream_t*>(TTYWrap::Unwrap(stdio
-              ->Get(String::NewSymbol("handle")).As<Object>())->UVHandle());
-        } else if (wrapType->Equals(String::NewSymbol("tcp"))) {
-          stream = reinterpret_cast<uv_stream_t*>(TCPWrap::Unwrap(stdio
-              ->Get(String::NewSymbol("handle")).As<Object>())->UVHandle());
-        } else if (wrapType->Equals(String::NewSymbol("udp"))) {
-          stream = reinterpret_cast<uv_stream_t*>(UDPWrap::Unwrap(stdio
-              ->Get(String::NewSymbol("handle")).As<Object>())->UVHandle());
-        }
+        uv_stream_t* stream = HandleToStream(
+            stdio->Get(String::NewSymbol("handle")).As<Object>());
         assert(stream != NULL);
 
         options->stdio[i].flags = UV_INHERIT_STREAM;
@@ -142,7 +128,7 @@ class ProcessWrap : public HandleWrap {
   }
 
   static Handle<Value> Spawn(const Arguments& args) {
-    HandleScope scope;
+    HandleScope scope(node_isolate);
 
     UNWRAP(ProcessWrap)
 
@@ -248,9 +234,9 @@ class ProcessWrap : public HandleWrap {
       SetErrno(uv_last_error(uv_default_loop()));
     }
     else {
-      wrap->SetHandle((uv_handle_t*)&wrap->process_);
       assert(wrap->process_.data == wrap);
-      wrap->object_->Set(String::New("pid"), Integer::New(wrap->process_.pid));
+      wrap->object_->Set(String::New("pid"),
+                         Integer::New(wrap->process_.pid, node_isolate));
     }
 
     if (options.args) {
@@ -265,11 +251,11 @@ class ProcessWrap : public HandleWrap {
 
     delete[] options.stdio;
 
-    return scope.Close(Integer::New(r));
+    return scope.Close(Integer::New(r, node_isolate));
   }
 
   static Handle<Value> Kill(const Arguments& args) {
-    HandleScope scope;
+    HandleScope scope(node_isolate);
 
     UNWRAP(ProcessWrap)
 
@@ -279,24 +265,29 @@ class ProcessWrap : public HandleWrap {
 
     if (r) SetErrno(uv_last_error(uv_default_loop()));
 
-    return scope.Close(Integer::New(r));
+    return scope.Close(Integer::New(r, node_isolate));
   }
 
   static void OnExit(uv_process_t* handle, int exit_status, int term_signal) {
-    HandleScope scope;
+    HandleScope scope(node_isolate);
 
     ProcessWrap* wrap = static_cast<ProcessWrap*>(handle->data);
     assert(wrap);
     assert(&wrap->process_ == handle);
 
     Local<Value> argv[2] = {
-      Integer::New(exit_status),
+      Integer::New(exit_status, node_isolate),
       String::New(signo_string(term_signal))
     };
+
+    if (exit_status == -1) {
+      SetErrno(uv_last_error(uv_default_loop()));
+    }
 
     if (onexit_sym.IsEmpty()) {
       onexit_sym = NODE_PSYMBOL("onexit");
     }
+
     MakeCallback(wrap->object_, onexit_sym, ARRAY_SIZE(argv), argv);
   }
 

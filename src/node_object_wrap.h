@@ -26,6 +26,15 @@
 #include "v8.h"
 #include <assert.h>
 
+// Explicitly instantiate some template classes, so we're sure they will be
+// present in the binary / shared object. There isn't much doubt that they will
+// be, but MSVC tends to complain about these things.
+#ifdef _MSC_VER
+  template class NODE_EXTERN v8::Persistent<v8::Object>;
+  template class NODE_EXTERN v8::Persistent<v8::FunctionTemplate>;
+#endif
+
+
 namespace node {
 
 class NODE_EXTERN ObjectWrap {
@@ -37,10 +46,11 @@ class NODE_EXTERN ObjectWrap {
 
   virtual ~ObjectWrap ( ) {
     if (!handle_.IsEmpty()) {
-      assert(handle_.IsNearDeath());
-      handle_.ClearWeak();
-      handle_->SetInternalField(0, v8::Undefined());
-      handle_.Dispose();
+      v8::Isolate* isolate = v8::Isolate::GetCurrent();
+      assert(handle_.IsNearDeath(isolate));
+      handle_.ClearWeak(isolate);
+      handle_->SetAlignedPointerInInternalField(0, 0);
+      handle_.Dispose(isolate);
       handle_.Clear();
     }
   }
@@ -50,7 +60,7 @@ class NODE_EXTERN ObjectWrap {
   static inline T* Unwrap (v8::Handle<v8::Object> handle) {
     assert(!handle.IsEmpty());
     assert(handle->InternalFieldCount() > 0);
-    return static_cast<T*>(handle->GetPointerFromInternalField(0));
+    return static_cast<T*>(handle->GetAlignedPointerFromInternalField(0));
   }
 
 
@@ -60,15 +70,17 @@ class NODE_EXTERN ObjectWrap {
   inline void Wrap (v8::Handle<v8::Object> handle) {
     assert(handle_.IsEmpty());
     assert(handle->InternalFieldCount() > 0);
-    handle_ = v8::Persistent<v8::Object>::New(handle);
-    handle_->SetPointerInInternalField(0, this);
+    v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    handle_ = v8::Persistent<v8::Object>::New(isolate, handle);
+    handle_->SetAlignedPointerInInternalField(0, this);
     MakeWeak();
   }
 
 
   inline void MakeWeak (void) {
-    handle_.MakeWeak(this, WeakCallback);
-    handle_.MarkIndependent();
+    v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    handle_.MakeWeak(isolate, this, WeakCallback);
+    handle_.MarkIndependent(isolate);
   }
 
   /* Ref() marks the object as being attached to an event loop.
@@ -78,7 +90,7 @@ class NODE_EXTERN ObjectWrap {
   virtual void Ref() {
     assert(!handle_.IsEmpty());
     refs_++;
-    handle_.ClearWeak();
+    handle_.ClearWeak(v8::Isolate::GetCurrent());
   }
 
   /* Unref() marks an object as detached from the event loop.  This is its
@@ -92,7 +104,7 @@ class NODE_EXTERN ObjectWrap {
    */
   virtual void Unref() {
     assert(!handle_.IsEmpty());
-    assert(!handle_.IsWeak());
+    assert(!handle_.IsWeak(v8::Isolate::GetCurrent()));
     assert(refs_ > 0);
     if (--refs_ == 0) { MakeWeak(); }
   }
@@ -102,14 +114,17 @@ class NODE_EXTERN ObjectWrap {
 
 
  private:
-  static void WeakCallback (v8::Persistent<v8::Value> value, void *data) {
-    ObjectWrap *obj = static_cast<ObjectWrap*>(data);
-    assert(value == obj->handle_);
-    assert(!obj->refs_);
-    assert(value.IsNearDeath());
-    delete obj;
+  static void WeakCallback(v8::Isolate* isolate,
+                           v8::Persistent<v8::Object>* pobj,
+                           ObjectWrap* wrap) {
+    v8::HandleScope scope(isolate);
+    assert(wrap->refs_ == 0);
+    assert(*pobj == wrap->handle_);
+    assert((*pobj).IsNearDeath(isolate));
+    delete wrap;
   }
 };
 
 } // namespace node
+
 #endif // object_wrap_h

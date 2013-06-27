@@ -22,12 +22,17 @@
 #include "node.h"
 #include "req_wrap.h"
 #include "handle_wrap.h"
+#include "string_bytes.h"
 
+#include "ares.h"
 #include "uv.h"
 
 #include "v8-debug.h"
-#if defined HAVE_DTRACE || defined HAVE_ETW
+#if defined HAVE_DTRACE || defined HAVE_ETW || defined HAVE_SYSTEMTAP
 # include "node_dtrace.h"
+#endif
+#if defined HAVE_PERFCTR
+# include "node_counters.h"
 #endif
 
 #include <locale.h>
@@ -56,26 +61,23 @@ typedef int mode_t;
 #include <sys/types.h>
 #include "zlib.h"
 
-#ifdef __POSIX__
+#if defined(__POSIX__) && !defined(__ANDROID__)
 # include <pwd.h> /* getpwnam() */
 # include <grp.h> /* getgrnam() */
 #endif
 
 #include "node_buffer.h"
-#ifdef __POSIX__
-# include "node_io_watcher.h"
-#endif
 #include "node_file.h"
 #include "node_http_parser.h"
-#ifdef __POSIX__
-# include "node_signal_watcher.h"
-#endif
 #include "node_constants.h"
 #include "node_javascript.h"
 #include "node_version.h"
 #include "node_string.h"
 #if HAVE_OPENSSL
 # include "node_crypto.h"
+#endif
+#if HAVE_SYSTEMTAP
+#include "node_provider.h"
 #endif
 #include "node_script.h"
 #include "v8_typed_array.h"
@@ -91,14 +93,20 @@ extern char **environ;
 
 namespace node {
 
-ngx_queue_t handle_wrap_queue = { &handle_wrap_queue, &handle_wrap_queue };
-ngx_queue_t req_wrap_queue = { &req_wrap_queue, &req_wrap_queue };
+QUEUE handle_wrap_queue = { &handle_wrap_queue, &handle_wrap_queue };
+QUEUE req_wrap_queue = { &req_wrap_queue, &req_wrap_queue };
 
 // declared in req_wrap.h
 Persistent<String> process_symbol;
 Persistent<String> domain_symbol;
 
-static Persistent<Object> process;
+// declared in node_internals.h
+Persistent<Object> process;
+
+static Persistent<Function> process_tickFromSpinner;
+static Persistent<Function> process_tickCallback;
+
+static Persistent<String> exports_symbol;
 
 static Persistent<String> errno_symbol;
 static Persistent<String> syscall_symbol;
@@ -109,34 +117,45 @@ static Persistent<String> rss_symbol;
 static Persistent<String> heap_total_symbol;
 static Persistent<String> heap_used_symbol;
 
-static Persistent<String> listeners_symbol;
-static Persistent<String> uncaught_exception_symbol;
-static Persistent<String> emit_symbol;
+static Persistent<String> fatal_exception_symbol;
 
 static Persistent<String> enter_symbol;
 static Persistent<String> exit_symbol;
 static Persistent<String> disposed_symbol;
 
+// Essential for node_wrap.h
+Persistent<FunctionTemplate> pipeConstructorTmpl;
+Persistent<FunctionTemplate> ttyConstructorTmpl;
+Persistent<FunctionTemplate> tcpConstructorTmpl;
+Persistent<FunctionTemplate> udpConstructorTmpl;
 
 static bool print_eval = false;
 static bool force_repl = false;
 static bool trace_deprecation = false;
+static bool throw_deprecation = false;
 static char *eval_string = NULL;
 static int option_end_index = 0;
 static bool use_debug_agent = false;
 static bool debug_wait_connect = false;
 static int debug_port=5858;
 static int max_stack_size = 0;
+bool using_domains = false;
 
 // used by C++ modules as well
 bool no_deprecation = false;
 
-static uv_check_t check_tick_watcher;
-static uv_prepare_t prepare_tick_watcher;
 static uv_idle_t tick_spinner;
-static bool need_tick_cb;
-static Persistent<String> tick_callback_sym;
 
+static uv_check_t check_immediate_watcher;
+static uv_idle_t idle_immediate_dummy;
+static bool need_immediate_cb;
+static Persistent<String> immediate_callback_sym;
+
+// for quick ref to tickCallback values
+static struct {
+  uint32_t length;
+  uint32_t index;
+} tick_infobox;
 
 #ifdef OPENSSL_NPN_NEGOTIATED
 static bool use_npn = true;
@@ -150,146 +169,37 @@ static bool use_sni = true;
 static bool use_sni = false;
 #endif
 
-#ifdef __POSIX__
-// Buffer for getpwnam_r(), getgrpam_r() and other misc callers; keep this
-// scoped at file-level rather than method-level to avoid excess stack usage.
-static char getbuf[PATH_MAX + 1];
-#endif
-
-// We need to notify V8 when we're idle so that it can run the garbage
-// collector. The interface to this is V8::IdleNotification(). It returns
-// true if the heap hasn't be fully compacted, and needs to be run again.
-// Returning false means that it doesn't have anymore work to do.
-//
-// A rather convoluted algorithm has been devised to determine when Node is
-// idle. You'll have to figure it out for yourself.
-static uv_check_t gc_check;
-static uv_idle_t gc_idle;
-static uv_timer_t gc_timer;
-bool need_gc;
-
 // process-relative uptime base, initialized at start-up
 static double prog_start_time;
 
-#define FAST_TICK 700.
-#define GC_WAIT_TIME 5000.
-#define RPM_SAMPLES 100
-#define TICK_TIME(n) tick_times[(tick_time_head - (n)) % RPM_SAMPLES]
-static int64_t tick_times[RPM_SAMPLES];
-static int tick_time_head;
+static volatile bool debugger_running = false;
+static uv_async_t dispatch_debug_messages_async;
+static uv_async_t emit_debug_enabled_async;
 
-static void CheckStatus(uv_timer_t* watcher, int status);
-
-static void StartGCTimer () {
-  if (!uv_is_active((uv_handle_t*) &gc_timer)) {
-    uv_timer_start(&gc_timer, node::CheckStatus, 5000, 5000);
-  }
-}
-
-static void StopGCTimer () {
-  if (uv_is_active((uv_handle_t*) &gc_timer)) {
-    uv_timer_stop(&gc_timer);
-  }
-}
-
-static void Idle(uv_idle_t* watcher, int status) {
-  assert((uv_idle_t*) watcher == &gc_idle);
-
-  if (V8::IdleNotification()) {
-    uv_idle_stop(&gc_idle);
-    StopGCTimer();
-  }
-}
+// Declared in node_internals.h
+Isolate* node_isolate = NULL;
 
 
-// Called directly after every call to select() (or epoll, or whatever)
-static void Check(uv_check_t* watcher, int status) {
-  assert(watcher == &gc_check);
-
-  tick_times[tick_time_head] = uv_now(uv_default_loop());
-  tick_time_head = (tick_time_head + 1) % RPM_SAMPLES;
-
-  StartGCTimer();
-
-  for (int i = 0; i < (int)(GC_WAIT_TIME/FAST_TICK); i++) {
-    double d = TICK_TIME(i+1) - TICK_TIME(i+2);
-    //printf("d = %f\n", d);
-    // If in the last 5 ticks the difference between
-    // ticks was less than 0.7 seconds, then continue.
-    if (d < FAST_TICK) {
-      //printf("---\n");
-      return;
-    }
-  }
-
-  // Otherwise start the gc!
-
-  //fprintf(stderr, "start idle 2\n");
-  uv_idle_start(&gc_idle, node::Idle);
-}
-
-
-static void Tick(void) {
-  // Avoid entering a V8 scope.
-  if (!need_tick_cb) return;
-  need_tick_cb = false;
-
-  uv_idle_stop(&tick_spinner);
-
-  HandleScope scope;
-
-  if (tick_callback_sym.IsEmpty()) {
-    // Lazily set the symbol
-    tick_callback_sym = NODE_PSYMBOL("_tickCallback");
-  }
-
-  Local<Value> cb_v = process->Get(tick_callback_sym);
-  if (!cb_v->IsFunction()) return;
-  Local<Function> cb = Local<Function>::Cast(cb_v);
-
-  TryCatch try_catch;
-
-  cb->Call(process, 0, NULL);
-
-  if (try_catch.HasCaught()) {
-    FatalException(try_catch);
-  }
-}
-
-
-static void Spin(uv_idle_t* handle, int status) {
-  assert((uv_idle_t*) handle == &tick_spinner);
+static void CheckImmediate(uv_check_t* handle, int status) {
+  assert(handle == &check_immediate_watcher);
   assert(status == 0);
-  Tick();
+
+  HandleScope scope(node_isolate);
+
+  if (immediate_callback_sym.IsEmpty()) {
+    immediate_callback_sym = NODE_PSYMBOL("_immediateCallback");
+  }
+
+  MakeCallback(process, immediate_callback_sym, 0, NULL);
 }
 
-static void StartTickSpinner() {
-  need_tick_cb = true;
-  // TODO: this tick_spinner shouldn't be necessary. An ev_prepare should be
-  // sufficent, the problem is only in the case of the very last "tick" -
-  // there is nothing left to do in the event loop and libev will exit. The
-  // ev_prepare callback isn't called before exiting. Thus we start this
-  // tick_spinner to keep the event loop alive long enough to handle it.
-  uv_idle_start(&tick_spinner, Spin);
-}
 
-static Handle<Value> NeedTickCallback(const Arguments& args) {
-  StartTickSpinner();
-  return Undefined();
-}
-
-static void PrepareTick(uv_prepare_t* handle, int status) {
-  assert(handle == &prepare_tick_watcher);
+static void IdleImmediateDummy(uv_idle_t* handle, int status) {
+  // Do nothing. Only for maintaining event loop
+  assert(handle == &idle_immediate_dummy);
   assert(status == 0);
-  Tick();
 }
 
-
-static void CheckTick(uv_check_t* handle, int status) {
-  assert(handle == &check_tick_watcher);
-  assert(status == 0);
-  Tick();
-}
 
 static inline const char *errno_string(int errorno) {
 #define ERRNO_CASE(e)  case e: return #e;
@@ -705,6 +615,10 @@ const char *signo_string(int signo) {
   SIGNO_CASE(SIGTSTP);
 #endif
 
+#ifdef SIGBREAK
+  SIGNO_CASE(SIGBREAK);
+#endif
+
 #ifdef SIGTTIN
   SIGNO_CASE(SIGTTIN);
 #endif
@@ -798,7 +712,7 @@ Local<Value> ErrnoException(int errorno,
 
   Local<Object> obj = e->ToObject();
 
-  obj->Set(errno_symbol, Integer::New(errorno));
+  obj->Set(errno_symbol, Integer::New(errorno, node_isolate));
   obj->Set(code_symbol, estring);
   if (path) obj->Set(errpath_symbol, String::New(path));
   if (syscall) obj->Set(syscall_symbol, String::NewSymbol(syscall));
@@ -870,7 +784,7 @@ Local<Value> UVException(int errorno,
   Local<Object> obj = e->ToObject();
 
   // TODO errno should probably go
-  obj->Set(errno_symbol, Integer::New(errorno));
+  obj->Set(errno_symbol, Integer::New(errorno, node_isolate));
   obj->Set(code_symbol, estring);
   if (path) obj->Set(errpath_symbol, path_str);
   if (syscall) obj->Set(syscall_symbol, String::NewSymbol(syscall));
@@ -931,7 +845,7 @@ Local<Value> WinapiErrnoException(int errorno,
 
   Local<Object> obj = e->ToObject();
 
-  obj->Set(errno_symbol, Integer::New(errorno));
+  obj->Set(errno_symbol, Integer::New(errorno, node_isolate));
   if (path) obj->Set(errpath_symbol, String::New(path));
   if (syscall) obj->Set(syscall_symbol, String::NewSymbol(syscall));
   return e;
@@ -939,77 +853,49 @@ Local<Value> WinapiErrnoException(int errorno,
 #endif
 
 
-Handle<Value> FromConstructorTemplate(Persistent<FunctionTemplate>& t,
+Handle<Value> FromConstructorTemplate(Persistent<FunctionTemplate> t,
                                       const Arguments& args) {
-  HandleScope scope;
-
-  const int argc = args.Length();
-  Local<Value>* argv = new Local<Value>[argc];
-
-  for (int i = 0; i < argc; ++i) {
-    argv[i] = args[i];
-  }
-
-  Local<Object> instance = t->GetFunction()->NewInstance(argc, argv);
-
-  delete[] argv;
-
-  return scope.Close(instance);
+  HandleScope scope(node_isolate);
+  Local<Value> argv[32];
+  unsigned argc = args.Length();
+  if (argc > ARRAY_SIZE(argv)) argc = ARRAY_SIZE(argv);
+  for (unsigned i = 0; i < argc; ++i) argv[i] = args[i];
+  return scope.Close(t->GetFunction()->NewInstance(argc, argv));
 }
 
 
-// MakeCallback may only be made directly off the event loop.
-// That is there can be no JavaScript stack frames underneath it.
-// (Is there any way to assert that?)
-//
-// Maybe make this a method of a node::Handle super class
-//
-Handle<Value>
-MakeCallback(const Handle<Object> object,
-             const char* method,
-             int argc,
-             Handle<Value> argv[]) {
-  HandleScope scope;
-
-  Handle<Value> ret =
-    MakeCallback(object, String::NewSymbol(method), argc, argv);
-
-  return scope.Close(ret);
-}
-
-Handle<Value>
-MakeCallback(const Handle<Object> object,
-             const Handle<String> symbol,
-             int argc,
-             Handle<Value> argv[]) {
-  HandleScope scope;
-
-  Local<Value> callback_v = object->Get(symbol);
-  if (!callback_v->IsFunction()) {
-    String::Utf8Value method(symbol);
-    // XXX: If the object has a domain attached, handle it there?
-    // At least, would be good to get *some* sort of indication
-    // of how we got here, even if it's not catchable.
-    fprintf(stderr, "Non-function in MakeCallback. method = %s\n", *method);
+Handle<Value> SetupDomainUse(const Arguments& args) {
+  HandleScope scope(node_isolate);
+  if (using_domains)
+    return Undefined(node_isolate);
+  using_domains = true;
+  Local<Value> tdc_v = process->Get(String::New("_tickDomainCallback"));
+  Local<Value> ndt_v = process->Get(String::New("_nextDomainTick"));
+  if (!tdc_v->IsFunction()) {
+    fprintf(stderr, "process._tickDomainCallback assigned to non-function\n");
     abort();
   }
-
-  Local<Function> callback = Local<Function>::Cast(callback_v);
-
-  return scope.Close(MakeCallback(object, callback, argc, argv));
+  if (!ndt_v->IsFunction()) {
+    fprintf(stderr, "process._nextDomainTick assigned to non-function\n");
+    abort();
+  }
+  Local<Function> tdc = tdc_v.As<Function>();
+  Local<Function> ndt = ndt_v.As<Function>();
+  process->Set(String::New("_tickCallback"), tdc);
+  process->Set(String::New("nextTick"), ndt);
+  process_tickCallback = Persistent<Function>::New(node_isolate, tdc);
+  return Undefined(node_isolate);
 }
 
-Handle<Value>
-MakeCallback(const Handle<Object> object,
-             const Handle<Function> callback,
-             int argc,
-             Handle<Value> argv[]) {
-  HandleScope scope;
 
+Handle<Value>
+MakeDomainCallback(const Handle<Object> object,
+                   const Handle<Function> callback,
+                   int argc,
+                   Handle<Value> argv[]) {
   // TODO Hook for long stack traces to be made here.
 
-  TryCatch try_catch;
-
+  // lazy load domain specific symbols
   if (enter_symbol.IsEmpty()) {
     enter_symbol = NODE_PSYMBOL("enter");
     exit_symbol = NODE_PSYMBOL("exit");
@@ -1020,62 +906,151 @@ MakeCallback(const Handle<Object> object,
   Local<Object> domain;
   Local<Function> enter;
   Local<Function> exit;
-  if (!domain_v->IsUndefined()) {
+
+  TryCatch try_catch;
+  try_catch.SetVerbose(true);
+
+  bool has_domain = domain_v->IsObject();
+  if (has_domain) {
     domain = domain_v->ToObject();
-    if (domain->Get(disposed_symbol)->BooleanValue()) {
+    assert(!domain.IsEmpty());
+    if (domain->Get(disposed_symbol)->IsTrue()) {
       // domain has been disposed of.
-      return Undefined();
+      return Undefined(node_isolate);
     }
     enter = Local<Function>::Cast(domain->Get(enter_symbol));
+    assert(!enter.IsEmpty());
     enter->Call(domain, 0, NULL);
-  }
 
-  if (try_catch.HasCaught()) {
-    FatalException(try_catch);
-    return Undefined();
+    if (try_catch.HasCaught()) {
+      return Undefined(node_isolate);
+    }
   }
 
   Local<Value> ret = callback->Call(object, argc, argv);
 
   if (try_catch.HasCaught()) {
-    FatalException(try_catch);
-    return Undefined();
+    return Undefined(node_isolate);
   }
 
-  if (!domain_v->IsUndefined()) {
+  if (has_domain) {
     exit = Local<Function>::Cast(domain->Get(exit_symbol));
+    assert(!exit.IsEmpty());
     exit->Call(domain, 0, NULL);
+
+    if (try_catch.HasCaught()) {
+      return Undefined(node_isolate);
+    }
   }
+
+  if (tick_infobox.length == 0) {
+    tick_infobox.index = 0;
+    return ret;
+  }
+
+  // process nextTicks after call
+  process_tickCallback->Call(process, 0, NULL);
 
   if (try_catch.HasCaught()) {
-    FatalException(try_catch);
-    return Undefined();
+    return Undefined(node_isolate);
   }
+
+  return ret;
+}
+
+
+Handle<Value>
+MakeCallback(const Handle<Object> object,
+             const Handle<Function> callback,
+             int argc,
+             Handle<Value> argv[]) {
+  // TODO Hook for long stack traces to be made here.
+
+  // lazy load no domain next tick callbacks
+  if (process_tickCallback.IsEmpty()) {
+    Local<Value> cb_v = process->Get(String::New("_tickCallback"));
+    if (!cb_v->IsFunction()) {
+      fprintf(stderr, "process._tickCallback assigned to non-function\n");
+      abort();
+    }
+    Local<Function> cb = cb_v.As<Function>();
+    process_tickCallback = Persistent<Function>::New(node_isolate, cb);
+  }
+
+  TryCatch try_catch;
+  try_catch.SetVerbose(true);
+
+  Local<Value> ret = callback->Call(object, argc, argv);
+
+  if (try_catch.HasCaught()) {
+    return Undefined(node_isolate);
+  }
+
+  if (tick_infobox.length == 0) {
+    tick_infobox.index = 0;
+    return ret;
+  }
+
+  // process nextTicks after call
+  process_tickCallback->Call(process, 0, NULL);
+
+  if (try_catch.HasCaught()) {
+    return Undefined(node_isolate);
+  }
+
+  return ret;
+}
+
+
+Handle<Value>
+MakeCallback(const Handle<Object> object,
+             const Handle<String> symbol,
+             int argc,
+             Handle<Value> argv[]) {
+  HandleScope scope(node_isolate);
+
+  Local<Function> callback = object->Get(symbol).As<Function>();
+
+  if (using_domains)
+    return scope.Close(MakeDomainCallback(object, callback, argc, argv));
+  return scope.Close(MakeCallback(object, callback, argc, argv));
+}
+
+
+Handle<Value>
+MakeCallback(const Handle<Object> object,
+             const char* method,
+             int argc,
+             Handle<Value> argv[]) {
+  HandleScope scope(node_isolate);
+
+  Handle<Value> ret =
+    MakeCallback(object, String::NewSymbol(method), argc, argv);
 
   return scope.Close(ret);
 }
 
 
 void SetErrno(uv_err_t err) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
+  static Persistent<String> errno_symbol;
   if (errno_symbol.IsEmpty()) {
-    errno_symbol = NODE_PSYMBOL("errno");
+    errno_symbol = NODE_PSYMBOL("_errno");
   }
 
   if (err.code == UV_UNKNOWN) {
     char errno_buf[100];
     snprintf(errno_buf, 100, "Unknown system errno %d", err.sys_errno_);
-    Context::GetCurrent()->Global()->Set(errno_symbol, String::New(errno_buf));
+    process->Set(errno_symbol, String::New(errno_buf));
   } else {
-    Context::GetCurrent()->Global()->Set(errno_symbol,
-                                         String::NewSymbol(uv_err_name(err)));
+    process->Set(errno_symbol, String::NewSymbol(uv_err_name(err)));
   }
 }
 
 
 enum encoding ParseEncoding(Handle<Value> encoding_v, enum encoding _default) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   if (!encoding_v->IsString()) return _default;
 
@@ -1093,8 +1068,14 @@ enum encoding ParseEncoding(Handle<Value> encoding_v, enum encoding _default) {
     return UCS2;
   } else if (strcasecmp(*encoding, "ucs-2") == 0) {
     return UCS2;
+  } else if (strcasecmp(*encoding, "utf16le") == 0) {
+    return UCS2;
+  } else if (strcasecmp(*encoding, "utf-16le") == 0) {
+    return UCS2;
   } else if (strcasecmp(*encoding, "binary") == 0) {
     return BINARY;
+  } else if (strcasecmp(*encoding, "buffer") == 0) {
+    return BUFFER;
   } else if (strcasecmp(*encoding, "hex") == 0) {
     return HEX;
   } else if (strcasecmp(*encoding, "raw") == 0) {
@@ -1115,30 +1096,14 @@ enum encoding ParseEncoding(Handle<Value> encoding_v, enum encoding _default) {
 }
 
 Local<Value> Encode(const void *buf, size_t len, enum encoding encoding) {
-  HandleScope scope;
-
-  if (!len) return scope.Close(String::Empty());
-
-  if (encoding == BINARY) {
-    const unsigned char *cbuf = static_cast<const unsigned char*>(buf);
-    uint16_t * twobytebuf = new uint16_t[len];
-    for (size_t i = 0; i < len; i++) {
-      // XXX is the following line platform independent?
-      twobytebuf[i] = cbuf[i];
-    }
-    Local<String> chunk = String::New(twobytebuf, len);
-    delete [] twobytebuf; // TODO use ExternalTwoByteString?
-    return scope.Close(chunk);
-  }
-
-  // utf8 or ascii encoding
-  Local<String> chunk = String::New((const char*)buf, len);
-  return scope.Close(chunk);
+  return StringBytes::Encode(static_cast<const char*>(buf),
+                             len,
+                             encoding);
 }
 
 // Returns -1 if the handle was not valid for decoding
 ssize_t DecodeBytes(v8::Handle<v8::Value> val, enum encoding encoding) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   if (val->IsArray()) {
     fprintf(stderr, "'raw' encoding (array of integers) has been removed. "
@@ -1147,17 +1112,7 @@ ssize_t DecodeBytes(v8::Handle<v8::Value> val, enum encoding encoding) {
     return -1;
   }
 
-  if (encoding == BINARY && Buffer::HasInstance(val)) {
-    return Buffer::Length(val->ToObject());
-  }
-
-  Local<String> str = val->ToString();
-
-  if (encoding == UTF8) return str->Utf8Length();
-  else if (encoding == UCS2) return str->Length() * 2;
-  else if (encoding == HEX) return str->Length() / 2;
-
-  return str->Length();
+  return StringBytes::Size(val, encoding);
 }
 
 #ifndef MIN
@@ -1169,56 +1124,17 @@ ssize_t DecodeWrite(char *buf,
                     size_t buflen,
                     v8::Handle<v8::Value> val,
                     enum encoding encoding) {
-  HandleScope scope;
-
-  // XXX
-  // A lot of improvement can be made here. See:
-  // http://code.google.com/p/v8/issues/detail?id=270
-  // http://groups.google.com/group/v8-dev/browse_thread/thread/dba28a81d9215291/ece2b50a3b4022c
-  // http://groups.google.com/group/v8-users/browse_thread/thread/1f83b0ba1f0a611
-
-  if (val->IsArray()) {
-    fprintf(stderr, "'raw' encoding (array of integers) has been removed. "
-                    "Use 'binary'.\n");
-    assert(0);
-    return -1;
-  }
-
-  Local<String> str = val->ToString();
-
-  if (encoding == UTF8) {
-    str->WriteUtf8(buf, buflen, NULL, String::HINT_MANY_WRITES_EXPECTED);
-    return buflen;
-  }
-
-  if (encoding == ASCII) {
-    str->WriteAscii(buf, 0, buflen, String::HINT_MANY_WRITES_EXPECTED);
-    return buflen;
-  }
-
-  // THIS IS AWFUL!!! FIXME
-
-  assert(encoding == BINARY);
-
-  uint16_t * twobytebuf = new uint16_t[buflen];
-
-  str->Write(twobytebuf, 0, buflen, String::HINT_MANY_WRITES_EXPECTED);
-
-  for (size_t i = 0; i < buflen; i++) {
-    unsigned char *b = reinterpret_cast<unsigned char*>(&twobytebuf[i]);
-    buf[i] = b[0];
-  }
-
-  delete [] twobytebuf;
-
-  return buflen;
+  return StringBytes::Write(buf, buflen, val, encoding, NULL);
 }
 
+void DisplayExceptionLine(Handle<Message> message) {
+  // Prevent re-entry into this function.  For example, if there is
+  // a throw from a program in vm.runInThisContext(code, filename, true),
+  // then we want to show the original failure, not the secondary one.
+  static bool displayed_error = false;
 
-void DisplayExceptionLine (TryCatch &try_catch) {
-  HandleScope scope;
-
-  Handle<Message> message = try_catch.Message();
+  if (displayed_error) return;
+  displayed_error = true;
 
   uv_tty_reset_mode();
 
@@ -1234,33 +1150,37 @@ void DisplayExceptionLine (TryCatch &try_catch) {
     String::Utf8Value sourceline(message->GetSourceLine());
     const char* sourceline_string = *sourceline;
 
-    // HACK HACK HACK
-    //
-    // FIXME
-    //
-    // Because of how CommonJS modules work, all scripts are wrapped with a
-    // "function (function (exports, __filename, ...) {"
+    // Because of how node modules work, all scripts are wrapped with a
+    // "function (module, exports, __filename, ...) {"
     // to provide script local variables.
     //
     // When reporting errors on the first line of a script, this wrapper
-    // function is leaked to the user. This HACK is to remove it. The length
-    // of the wrapper is 62. That wrapper is defined in src/node.js
+    // function is leaked to the user. There used to be a hack here to
+    // truncate off the first 62 characters, but it caused numerous other
+    // problems when vm.runIn*Context() methods were used for non-module
+    // code.
     //
-    // If that wrapper is ever changed, then this number also has to be
-    // updated. Or - someone could clean this up so that the two peices
-    // don't need to be changed.
+    // If we ever decide to re-instate such a hack, the following steps
+    // must be taken:
     //
-    // Even better would be to get support into V8 for wrappers that
-    // shouldn't be reported to users.
-    int offset = linenum == 1 ? 62 : 0;
+    // 1. Pass a flag around to say "this code was wrapped"
+    // 2. Update the stack frame output so that it is also correct.
+    //
+    // It would probably be simpler to add a line rather than add some
+    // number of characters to the first line, since V8 truncates the
+    // sourceline to 78 characters, and we end up not providing very much
+    // useful debugging info to the user if we remove 62 characters.
 
-    fprintf(stderr, "%s\n", sourceline_string + offset);
-    // Print wavy underline (GetUnderline is deprecated).
     int start = message->GetStartColumn();
-    for (int i = offset; i < start; i++) {
+    int end = message->GetEndColumn();
+
+    // fprintf(stderr, "---\nsourceline:%s\noffset:%d\nstart:%d\nend:%d\n---\n", sourceline_string, start, end);
+
+    fprintf(stderr, "%s\n", sourceline_string);
+    // Print wavy underline (GetUnderline is deprecated).
+    for (int i = 0; i < start; i++) {
       fputc((sourceline_string[i] == '\t') ? '\t' : ' ', stderr);
     }
-    int end = message->GetEndColumn();
     for (int i = start; i < end; i++) {
       fputc('^', stderr);
     }
@@ -1269,21 +1189,21 @@ void DisplayExceptionLine (TryCatch &try_catch) {
 }
 
 
-static void ReportException(TryCatch &try_catch, bool show_line) {
-  HandleScope scope;
+static void ReportException(Handle<Value> er, Handle<Message> message) {
+  HandleScope scope(node_isolate);
 
-  if (show_line) DisplayExceptionLine(try_catch);
+  DisplayExceptionLine(message);
 
-  String::Utf8Value trace(try_catch.StackTrace());
+  Local<Value> trace_value(er->ToObject()->Get(String::New("stack")));
+  String::Utf8Value trace(trace_value);
 
   // range errors have a trace member set to undefined
-  if (trace.length() > 0 && !try_catch.StackTrace()->IsUndefined()) {
+  if (trace.length() > 0 && !trace_value->IsUndefined()) {
     fprintf(stderr, "%s\n", *trace);
   } else {
     // this really only happens for RangeErrors, since they're the only
     // kind that won't have all this info in the trace, or when non-Error
     // objects are thrown manually.
-    Local<Value> er = try_catch.Exception();
     bool isErrorObject = er->IsObject() &&
       !(er->ToObject()->Get(String::New("message"))->IsUndefined()) &&
       !(er->ToObject()->Get(String::New("name"))->IsUndefined());
@@ -1301,21 +1221,31 @@ static void ReportException(TryCatch &try_catch, bool show_line) {
   fflush(stderr);
 }
 
+
+static void ReportException(TryCatch& try_catch) {
+  ReportException(try_catch.Exception(), try_catch.Message());
+}
+
+
 // Executes a str within the current v8 context.
 Local<Value> ExecuteString(Handle<String> source, Handle<Value> filename) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
   TryCatch try_catch;
+
+  // try_catch must be nonverbose to disable FatalException() handler,
+  // we will handle exceptions ourself.
+  try_catch.SetVerbose(false);
 
   Local<v8::Script> script = v8::Script::Compile(source, filename);
   if (script.IsEmpty()) {
-    ReportException(try_catch, true);
-    exit(1);
+    ReportException(try_catch);
+    exit(3);
   }
 
   Local<Value> result = script->Run();
   if (result.IsEmpty()) {
-    ReportException(try_catch, true);
-    exit(1);
+    ReportException(try_catch);
+    exit(4);
   }
 
   return scope.Close(result);
@@ -1323,13 +1253,13 @@ Local<Value> ExecuteString(Handle<String> source, Handle<Value> filename) {
 
 
 static Handle<Value> GetActiveRequests(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   Local<Array> ary = Array::New();
-  ngx_queue_t* q = NULL;
+  QUEUE* q = NULL;
   int i = 0;
 
-  ngx_queue_foreach(q, &req_wrap_queue) {
+  QUEUE_FOREACH(q, &req_wrap_queue) {
     ReqWrap<uv_req_t>* w = container_of(q, ReqWrap<uv_req_t>, req_wrap_queue_);
     if (w->object_.IsEmpty()) continue;
     ary->Set(i++, w->object_);
@@ -1342,17 +1272,17 @@ static Handle<Value> GetActiveRequests(const Arguments& args) {
 // Non-static, friend of HandleWrap. Could have been a HandleWrap method but
 // implemented here for consistency with GetActiveRequests().
 Handle<Value> GetActiveHandles(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   Local<Array> ary = Array::New();
-  ngx_queue_t* q = NULL;
+  QUEUE* q = NULL;
   int i = 0;
 
   Local<String> owner_sym = String::New("owner");
 
-  ngx_queue_foreach(q, &handle_wrap_queue) {
+  QUEUE_FOREACH(q, &handle_wrap_queue) {
     HandleWrap* w = container_of(q, HandleWrap, handle_wrap_queue_);
-    if (w->object_.IsEmpty() || w->unref_) continue;
+    if (w->object_.IsEmpty() || (w->flags_ & HandleWrap::kUnref)) continue;
     Local<Value> obj = w->object_->Get(owner_sym);
     if (obj->IsUndefined()) obj = *w->object_;
     ary->Set(i++, obj);
@@ -1364,12 +1294,12 @@ Handle<Value> GetActiveHandles(const Arguments& args) {
 
 static Handle<Value> Abort(const Arguments& args) {
   abort();
-  return Undefined();
+  return Undefined(node_isolate);
 }
 
 
 static Handle<Value> Chdir(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   if (args.Length() != 1 || !args[0]->IsString()) {
     return ThrowException(Exception::Error(String::New("Bad argument.")));
@@ -1383,12 +1313,12 @@ static Handle<Value> Chdir(const Arguments& args) {
     return ThrowException(UVException(r.code, "uv_chdir"));
   }
 
-  return Undefined();
+  return Undefined(node_isolate);
 }
 
 
 static Handle<Value> Cwd(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 #ifdef _WIN32
   /* MAX_PATH is in characters, not bytes. Make sure we have enough headroom. */
   char buf[MAX_PATH * 4 + 1];
@@ -1409,7 +1339,7 @@ static Handle<Value> Cwd(const Arguments& args) {
 
 
 static Handle<Value> Umask(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
   unsigned int old;
 
   if (args.Length() < 1 || args[0]->IsUndefined()) {
@@ -1442,189 +1372,312 @@ static Handle<Value> Umask(const Arguments& args) {
     old = umask(static_cast<mode_t>(oct));
   }
 
-  return scope.Close(Uint32::New(old));
+  return scope.Close(Uint32::New(old, node_isolate));
 }
 
 
-#ifdef __POSIX__
+#if defined(__POSIX__) && !defined(__ANDROID__)
+
+static const uid_t uid_not_found = static_cast<uid_t>(-1);
+static const gid_t gid_not_found = static_cast<gid_t>(-1);
+
+
+static uid_t uid_by_name(const char* name) {
+  struct passwd pwd;
+  struct passwd* pp;
+  char buf[8192];
+
+  errno = 0;
+  pp = NULL;
+
+  if (getpwnam_r(name, &pwd, buf, sizeof(buf), &pp) == 0 && pp != NULL) {
+    return pp->pw_uid;
+  }
+
+  return uid_not_found;
+}
+
+
+static char* name_by_uid(uid_t uid) {
+  struct passwd pwd;
+  struct passwd* pp;
+  char buf[8192];
+  int rc;
+
+  errno = 0;
+  pp = NULL;
+
+  if ((rc = getpwuid_r(uid, &pwd, buf, sizeof(buf), &pp)) == 0 && pp != NULL) {
+    return strdup(pp->pw_name);
+  }
+
+  if (rc == 0) {
+    errno = ENOENT;
+  }
+
+  return NULL;
+}
+
+
+static gid_t gid_by_name(const char* name) {
+  struct group pwd;
+  struct group* pp;
+  char buf[8192];
+
+  errno = 0;
+  pp = NULL;
+
+  if (getgrnam_r(name, &pwd, buf, sizeof(buf), &pp) == 0 && pp != NULL) {
+    return pp->gr_gid;
+  }
+
+  return gid_not_found;
+}
+
+
+#if 0  // For future use.
+static const char* name_by_gid(gid_t gid) {
+  struct group pwd;
+  struct group* pp;
+  char buf[8192];
+  int rc;
+
+  errno = 0;
+  pp = NULL;
+
+  if ((rc = getgrgid_r(gid, &pwd, buf, sizeof(buf), &pp)) == 0 && pp != NULL) {
+    return strdup(pp->gr_name);
+  }
+
+  if (rc == 0) {
+    errno = ENOENT;
+  }
+
+  return NULL;
+}
+#endif
+
+
+static uid_t uid_by_name(Handle<Value> value) {
+  if (value->IsUint32()) {
+    return static_cast<uid_t>(value->Uint32Value());
+  } else {
+    String::Utf8Value name(value);
+    return uid_by_name(*name);
+  }
+}
+
+
+static gid_t gid_by_name(Handle<Value> value) {
+  if (value->IsUint32()) {
+    return static_cast<gid_t>(value->Uint32Value());
+  } else {
+    String::Utf8Value name(value);
+    return gid_by_name(*name);
+  }
+}
+
 
 static Handle<Value> GetUid(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
   int uid = getuid();
-  return scope.Close(Integer::New(uid));
+  return scope.Close(Integer::New(uid, node_isolate));
 }
 
 
 static Handle<Value> GetGid(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
   int gid = getgid();
-  return scope.Close(Integer::New(gid));
+  return scope.Close(Integer::New(gid, node_isolate));
 }
 
 
 static Handle<Value> SetGid(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
-  if (args.Length() < 1) {
-    return ThrowException(Exception::Error(
-      String::New("setgid requires 1 argument")));
+  if (!args[0]->IsUint32() && !args[0]->IsString()) {
+    return ThrowTypeError("setgid argument must be a number or a string");
   }
 
-  int gid;
+  gid_t gid = gid_by_name(args[0]);
 
-  if (args[0]->IsNumber()) {
-    gid = args[0]->Int32Value();
-  } else if (args[0]->IsString()) {
-    String::Utf8Value grpnam(args[0]);
-    struct group grp, *grpp = NULL;
-    int err;
-
-    if ((err = getgrnam_r(*grpnam, &grp, getbuf, ARRAY_SIZE(getbuf), &grpp)) ||
-        grpp == NULL) {
-      if (errno == 0)
-        return ThrowException(Exception::Error(
-          String::New("setgid group id does not exist")));
-      else
-        return ThrowException(ErrnoException(errno, "getgrnam_r"));
-    }
-
-    gid = grpp->gr_gid;
-  } else {
-    return ThrowException(Exception::Error(
-      String::New("setgid argument must be a number or a string")));
+  if (gid == gid_not_found) {
+    return ThrowError("setgid group id does not exist");
   }
 
-  int result;
-  if ((result = setgid(gid)) != 0) {
+  if (setgid(gid)) {
     return ThrowException(ErrnoException(errno, "setgid"));
   }
-  return Undefined();
+
+  return Undefined(node_isolate);
 }
 
 
 static Handle<Value> SetUid(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
-  if (args.Length() < 1) {
-    return ThrowException(Exception::Error(
-          String::New("setuid requires 1 argument")));
+  if (!args[0]->IsUint32() && !args[0]->IsString()) {
+    return ThrowTypeError("setuid argument must be a number or a string");
   }
 
-  int uid;
+  uid_t uid = uid_by_name(args[0]);
 
-  if (args[0]->IsNumber()) {
-    uid = args[0]->Int32Value();
-  } else if (args[0]->IsString()) {
-    String::Utf8Value pwnam(args[0]);
-    struct passwd pwd, *pwdp = NULL;
-    int err;
-
-    if ((err = getpwnam_r(*pwnam, &pwd, getbuf, ARRAY_SIZE(getbuf), &pwdp)) ||
-        pwdp == NULL) {
-      if (errno == 0)
-        return ThrowException(Exception::Error(
-          String::New("setuid user id does not exist")));
-      else
-        return ThrowException(ErrnoException(errno, "getpwnam_r"));
-    }
-
-    uid = pwdp->pw_uid;
-  } else {
-    return ThrowException(Exception::Error(
-      String::New("setuid argument must be a number or a string")));
+  if (uid == uid_not_found) {
+    return ThrowError("setuid user id does not exist");
   }
 
-  int result;
-  if ((result = setuid(uid)) != 0) {
+  if (setuid(uid)) {
     return ThrowException(ErrnoException(errno, "setuid"));
   }
-  return Undefined();
+
+  return Undefined(node_isolate);
 }
 
 
-#endif // __POSIX__
+static Handle<Value> GetGroups(const Arguments& args) {
+  HandleScope scope(node_isolate);
+
+  int ngroups = getgroups(0, NULL);
+
+  if (ngroups == -1) {
+    return ThrowException(ErrnoException(errno, "getgroups"));
+  }
+
+  gid_t* groups = new gid_t[ngroups];
+
+  ngroups = getgroups(ngroups, groups);
+
+  if (ngroups == -1) {
+    delete[] groups;
+    return ThrowException(ErrnoException(errno, "getgroups"));
+  }
+
+  Local<Array> groups_list = Array::New(ngroups);
+  bool seen_egid = false;
+  gid_t egid = getegid();
+
+  for (int i = 0; i < ngroups; i++) {
+    groups_list->Set(i, Integer::New(groups[i], node_isolate));
+    if (groups[i] == egid) seen_egid = true;
+  }
+
+  delete[] groups;
+
+  if (seen_egid == false) {
+    groups_list->Set(ngroups, Integer::New(egid, node_isolate));
+  }
+
+  return scope.Close(groups_list);
+}
+
+
+static Handle<Value> SetGroups(const Arguments& args) {
+  HandleScope scope(node_isolate);
+
+  if (!args[0]->IsArray()) {
+    return ThrowTypeError("argument 1 must be an array");
+  }
+
+  Local<Array> groups_list = args[0].As<Array>();
+  size_t size = groups_list->Length();
+  gid_t* groups = new gid_t[size];
+
+  for (size_t i = 0; i < size; i++) {
+    gid_t gid = gid_by_name(groups_list->Get(i));
+
+    if (gid == gid_not_found) {
+      delete[] groups;
+      return ThrowError("group name not found");
+    }
+
+    groups[i] = gid;
+  }
+
+  int rc = setgroups(size, groups);
+  delete[] groups;
+
+  if (rc == -1) {
+    return ThrowException(ErrnoException(errno, "setgroups"));
+  }
+
+  return Undefined(node_isolate);
+}
+
+
+static Handle<Value> InitGroups(const Arguments& args) {
+  HandleScope scope(node_isolate);
+
+  if (!args[0]->IsUint32() && !args[0]->IsString()) {
+    return ThrowTypeError("argument 1 must be a number or a string");
+  }
+
+  if (!args[1]->IsUint32() && !args[1]->IsString()) {
+    return ThrowTypeError("argument 2 must be a number or a string");
+  }
+
+  String::Utf8Value arg0(args[0]);
+  gid_t extra_group;
+  bool must_free;
+  char* user;
+
+  if (args[0]->IsUint32()) {
+    user = name_by_uid(args[0]->Uint32Value());
+    must_free = true;
+  } else {
+    user = *arg0;
+    must_free = false;
+  }
+
+  if (user == NULL) {
+    return ThrowError("initgroups user not found");
+  }
+
+  extra_group = gid_by_name(args[1]);
+
+  if (extra_group == gid_not_found) {
+    if (must_free) free(user);
+    return ThrowError("initgroups extra group not found");
+  }
+
+  int rc = initgroups(user, extra_group);
+
+  if (must_free) {
+    free(user);
+  }
+
+  if (rc) {
+    return ThrowException(ErrnoException(errno, "initgroups"));
+  }
+
+  return Undefined(node_isolate);
+}
+
+#endif // __POSIX__ && !defined(__ANDROID__)
 
 
 v8::Handle<v8::Value> Exit(const v8::Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
   exit(args[0]->IntegerValue());
-  return Undefined();
-}
-
-
-static void CheckStatus(uv_timer_t* watcher, int status) {
-  assert(watcher == &gc_timer);
-
-  // check memory
-  if (!uv_is_active((uv_handle_t*) &gc_idle)) {
-    HeapStatistics stats;
-    V8::GetHeapStatistics(&stats);
-    if (stats.total_heap_size() > 1024 * 1024 * 128) {
-      // larger than 128 megs, just start the idle watcher
-      uv_idle_start(&gc_idle, node::Idle);
-      return;
-    }
-  }
-
-  double d = uv_now(uv_default_loop()) - TICK_TIME(3);
-
-  //printfb("timer d = %f\n", d);
-
-  if (d  >= GC_WAIT_TIME - 1.) {
-    //fprintf(stderr, "start idle\n");
-    uv_idle_start(&gc_idle, node::Idle);
-  }
+  return Undefined(node_isolate);
 }
 
 
 static Handle<Value> Uptime(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
   double uptime;
 
   uv_err_t err = uv_uptime(&uptime);
 
   if (err.code != UV_OK) {
-    return Undefined();
+    return Undefined(node_isolate);
   }
 
   return scope.Close(Number::New(uptime - prog_start_time));
 }
 
 
-v8::Handle<v8::Value> UVCounters(const v8::Arguments& args) {
-  HandleScope scope;
-
-  uv_counters_t* c = &uv_default_loop()->counters;
-
-  Local<Object> obj = Object::New();
-
-#define setc(name) \
-    obj->Set(String::New(#name), Integer::New(static_cast<int32_t>(c->name)));
-
-  setc(eio_init)
-  setc(req_init)
-  setc(handle_init)
-  setc(stream_init)
-  setc(tcp_init)
-  setc(udp_init)
-  setc(pipe_init)
-  setc(tty_init)
-  setc(prepare_init)
-  setc(check_init)
-  setc(idle_init)
-  setc(async_init)
-  setc(timer_init)
-  setc(process_init)
-  setc(fs_event_init)
-
-#undef setc
-
-  return scope.Close(obj);
-}
-
-
 v8::Handle<v8::Value> MemoryUsage(const v8::Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   size_t rss;
 
@@ -1646,18 +1699,20 @@ v8::Handle<v8::Value> MemoryUsage(const v8::Arguments& args) {
 
   // V8 memory usage
   HeapStatistics v8_heap_stats;
-  V8::GetHeapStatistics(&v8_heap_stats);
+  node_isolate->GetHeapStatistics(&v8_heap_stats);
   info->Set(heap_total_symbol,
-            Integer::NewFromUnsigned(v8_heap_stats.total_heap_size()));
+            Integer::NewFromUnsigned(v8_heap_stats.total_heap_size(),
+                                     node_isolate));
   info->Set(heap_used_symbol,
-            Integer::NewFromUnsigned(v8_heap_stats.used_heap_size()));
+            Integer::NewFromUnsigned(v8_heap_stats.used_heap_size(),
+                                     node_isolate));
 
   return scope.Close(info);
 }
 
 
 Handle<Value> Kill(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   if (args.Length() != 2) {
     return ThrowException(Exception::Error(String::New("Bad argument.")));
@@ -1669,10 +1724,10 @@ Handle<Value> Kill(const Arguments& args) {
 
   if (err.code != UV_OK) {
     SetErrno(err);
-    return scope.Close(Integer::New(-1));
+    return scope.Close(Integer::New(-1, node_isolate));
   }
 
-  return Undefined();
+  return Undefined(node_isolate);
 }
 
 // used in Hrtime() below
@@ -1684,12 +1739,17 @@ Handle<Value> Kill(const Arguments& args) {
 // and nanoseconds, to avoid any integer overflow possibility.
 // Pass in an Array from a previous hrtime() call to instead get a time diff.
 Handle<Value> Hrtime(const v8::Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   uint64_t t = uv_hrtime();
 
   if (args.Length() > 0) {
     // return a time diff tuple
+    if (!args[0]->IsArray()) {
+      Local<Value> exception = Exception::TypeError(
+          String::New("process.hrtime() only accepts an Array tuple."));
+      return ThrowException(exception);
+    }
     Local<Array> inArray = Local<Array>::Cast(args[0]);
     uint64_t seconds = inArray->Get(0)->Uint32Value();
     uint64_t nanos = inArray->Get(1)->Uint32Value();
@@ -1697,8 +1757,8 @@ Handle<Value> Hrtime(const v8::Arguments& args) {
   }
 
   Local<Array> tuple = Array::New(2);
-  tuple->Set(0, Integer::NewFromUnsigned(t / NANOS_PER_SEC));
-  tuple->Set(1, Integer::NewFromUnsigned(t % NANOS_PER_SEC));
+  tuple->Set(0, Integer::NewFromUnsigned(t / NANOS_PER_SEC, node_isolate));
+  tuple->Set(1, Integer::NewFromUnsigned(t % NANOS_PER_SEC, node_isolate));
 
   return scope.Close(tuple);
 }
@@ -1706,13 +1766,12 @@ Handle<Value> Hrtime(const v8::Arguments& args) {
 
 typedef void (UV_DYNAMIC* extInit)(Handle<Object> exports);
 
-// DLOpen is node.dlopen(). Used to load 'module.node' dynamically shared
-// objects.
+// DLOpen is process.dlopen(module, filename).
+// Used to load 'module.node' dynamically shared objects.
 Handle<Value> DLOpen(const v8::Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
   char symbol[1024], *base, *pos;
   uv_lib_t lib;
-  node_module_struct compat_mod;
   int r;
 
   if (args.Length() < 2) {
@@ -1721,19 +1780,24 @@ Handle<Value> DLOpen(const v8::Arguments& args) {
     return ThrowException(exception);
   }
 
-  String::Utf8Value filename(args[0]); // Cast
-  Local<Object> target = args[1]->ToObject(); // Cast
+  Local<Object> module = args[0]->ToObject(); // Cast
+  String::Utf8Value filename(args[1]); // Cast
+
+  if (exports_symbol.IsEmpty()) {
+    exports_symbol = NODE_PSYMBOL("exports");
+  }
+  Local<Object> exports = module->Get(exports_symbol)->ToObject();
 
   if (uv_dlopen(*filename, &lib)) {
     Local<String> errmsg = String::New(uv_dlerror(&lib));
 #ifdef _WIN32
     // Windows needs to add the filename into the error message
-    errmsg = String::Concat(errmsg, args[0]->ToString());
+    errmsg = String::Concat(errmsg, args[1]->ToString());
 #endif
     return ThrowException(Exception::Error(errmsg));
   }
 
-  String::Utf8Value path(args[0]);
+  String::Utf8Value path(args[1]);
   base = *path;
 
   /* Find the shared library filename within the full path. */
@@ -1766,35 +1830,35 @@ Handle<Value> DLOpen(const v8::Arguments& args) {
     return ThrowException(exception);
   }
 
-  // Get the init() function from the dynamically shared object.
+  /* Replace dashes with underscores. When loading foo-bar.node,
+   * look for foo_bar_module, not foo-bar_module.
+   */
+  for (pos = symbol; *pos != '\0'; ++pos) {
+    if (*pos == '-') *pos = '_';
+  }
+
   node_module_struct *mod;
   if (uv_dlsym(&lib, symbol, reinterpret_cast<void**>(&mod))) {
-    /* Start Compatibility hack: Remove once everyone is using NODE_MODULE macro */
-    memset(&compat_mod, 0, sizeof compat_mod);
-
-    mod = &compat_mod;
-    mod->version = NODE_MODULE_VERSION;
-
-    if (uv_dlsym(&lib, "init", reinterpret_cast<void**>(&mod->register_func))) {
-      Local<String> errmsg = String::New(uv_dlerror(&lib));
-      uv_dlclose(&lib);
-      return ThrowException(Exception::Error(errmsg));
-    }
-    /* End Compatibility hack */
+    char errmsg[1024];
+    snprintf(errmsg, sizeof(errmsg), "Symbol %s not found.", symbol);
+    return ThrowError(errmsg);
   }
 
   if (mod->version != NODE_MODULE_VERSION) {
-    Local<Value> exception = Exception::Error(
-        String::New("Module version mismatch, refusing to load."));
-    return ThrowException(exception);
+    char errmsg[1024];
+    snprintf(errmsg,
+             sizeof(errmsg),
+             "Module version mismatch. Expected %d, got %d.",
+             NODE_MODULE_VERSION, mod->version);
+    return ThrowError(errmsg);
   }
 
   // Execute the C++ module
-  mod->register_func(target);
+  mod->register_func(exports, module);
 
   // Tell coverity that 'handle' should not be freed when we return.
   // coverity[leaked_storage]
-  return Undefined();
+  return Undefined(node_isolate);
 }
 
 
@@ -1804,58 +1868,60 @@ static void OnFatalError(const char* location, const char* message) {
   } else {
     fprintf(stderr, "FATAL ERROR: %s\n", message);
   }
-  exit(1);
+  exit(5);
 }
 
-void FatalException(TryCatch &try_catch) {
-  HandleScope scope;
 
-  if (listeners_symbol.IsEmpty()) {
-    listeners_symbol = NODE_PSYMBOL("listeners");
-    uncaught_exception_symbol = NODE_PSYMBOL("uncaughtException");
-    emit_symbol = NODE_PSYMBOL("emit");
+void FatalException(Handle<Value> error, Handle<Message> message) {
+  HandleScope scope(node_isolate);
+
+  if (fatal_exception_symbol.IsEmpty())
+    fatal_exception_symbol = NODE_PSYMBOL("_fatalException");
+
+  Local<Value> fatal_v = process->Get(fatal_exception_symbol);
+
+  if (!fatal_v->IsFunction()) {
+    // failed before the process._fatalException function was added!
+    // this is probably pretty bad.  Nothing to do but report and exit.
+    ReportException(error, message);
+    exit(6);
   }
 
-  Local<Value> listeners_v = process->Get(listeners_symbol);
-  assert(listeners_v->IsFunction());
+  Local<Function> fatal_f = Local<Function>::Cast(fatal_v);
 
-  Local<Function> listeners = Local<Function>::Cast(listeners_v);
+  TryCatch fatal_try_catch;
 
-  Local<String> uncaught_exception_symbol_l = Local<String>::New(uncaught_exception_symbol);
-  Local<Value> argv[1] = { uncaught_exception_symbol_l  };
-  Local<Value> ret = listeners->Call(process, 1, argv);
+  // Do not call FatalException when _fatalException handler throws
+  fatal_try_catch.SetVerbose(false);
 
-  assert(ret->IsArray());
+  // this will return true if the JS layer handled it, false otherwise
+  Local<Value> caught = fatal_f->Call(process, 1, &error);
 
-  Local<Array> listener_array = Local<Array>::Cast(ret);
-
-  uint32_t length = listener_array->Length();
-  // Report and exit if process has no "uncaughtException" listener
-  if (length == 0) {
-    ReportException(try_catch, true);
-    exit(1);
+  if (fatal_try_catch.HasCaught()) {
+    // the fatal exception function threw, so we must exit
+    ReportException(fatal_try_catch);
+    exit(7);
   }
 
-  // Otherwise fire the process "uncaughtException" event
-  Local<Value> emit_v = process->Get(emit_symbol);
-  assert(emit_v->IsFunction());
-
-  Local<Function> emit = Local<Function>::Cast(emit_v);
-
-  Local<Value> error = try_catch.Exception();
-  Local<Value> event_argv[2] = { uncaught_exception_symbol_l, error };
-
-  TryCatch event_try_catch;
-  emit->Call(process, 2, event_argv);
-
-  if (event_try_catch.HasCaught()) {
-    // the uncaught exception event threw, so we must exit.
-    ReportException(event_try_catch, true);
-    exit(1);
+  if (false == caught->BooleanValue()) {
+    ReportException(error, message);
+    exit(8);
   }
+}
 
-  // This makes sure uncaught exceptions don't interfere with process.nextTick
-  StartTickSpinner();
+
+void FatalException(TryCatch& try_catch) {
+  HandleScope scope(node_isolate);
+  // TODO do not call FatalException if try_catch is verbose
+  // (requires V8 API to expose getter for try_catch.is_verbose_)
+  FatalException(try_catch.Exception(), try_catch.Message());
+}
+
+
+void OnMessage(Handle<Message> message, Handle<Value> error) {
+  // The current version of V8 sends messages for errors only
+  // (thus `error` is always set).
+  FatalException(error, message);
 }
 
 
@@ -1863,14 +1929,14 @@ Persistent<Object> binding_cache;
 Persistent<Array> module_load_list;
 
 static Handle<Value> Binding(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   Local<String> module = args[0]->ToString();
   String::Utf8Value module_v(module);
   node_module_struct* modp;
 
   if (binding_cache.IsEmpty()) {
-    binding_cache = Persistent<Object>::New(Object::New());
+    binding_cache = Persistent<Object>::New(node_isolate, Object::New());
   }
 
   Local<Object> exports;
@@ -1888,20 +1954,15 @@ static Handle<Value> Binding(const Arguments& args) {
 
   if ((modp = get_builtin_module(*module_v)) != NULL) {
     exports = Object::New();
-    modp->register_func(exports);
+    // Internal bindings don't have a "module" object,
+    // only exports.
+    modp->register_func(exports, Undefined(node_isolate));
     binding_cache->Set(module, exports);
 
   } else if (!strcmp(*module_v, "constants")) {
     exports = Object::New();
     DefineConstants(exports);
     binding_cache->Set(module, exports);
-
-#ifdef __POSIX__
-  } else if (!strcmp(*module_v, "io_watcher")) {
-    exports = Object::New();
-    IOWatcher::Initialize(exports);
-    binding_cache->Set(module, exports);
-#endif
 
   } else if (!strcmp(*module_v, "natives")) {
     exports = Object::New();
@@ -1919,7 +1980,7 @@ static Handle<Value> Binding(const Arguments& args) {
 
 static Handle<Value> ProcessTitleGetter(Local<String> property,
                                         const AccessorInfo& info) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
   char buffer[512];
   uv_get_process_title(buffer, sizeof(buffer));
   return scope.Close(String::New(buffer));
@@ -1929,7 +1990,7 @@ static Handle<Value> ProcessTitleGetter(Local<String> property,
 static void ProcessTitleSetter(Local<String> property,
                                Local<Value> value,
                                const AccessorInfo& info) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
   String::Utf8Value title(value);
   // TODO: protect with a lock
   uv_set_process_title(*title);
@@ -1938,7 +1999,7 @@ static void ProcessTitleSetter(Local<String> property,
 
 static Handle<Value> EnvGetter(Local<String> property,
                                const AccessorInfo& info) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 #ifdef __POSIX__
   String::Utf8Value key(property);
   const char* val = getenv(*key);
@@ -1967,7 +2028,7 @@ static Handle<Value> EnvGetter(Local<String> property,
 static Handle<Value> EnvSetter(Local<String> property,
                                Local<Value> value,
                                const AccessorInfo& info) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 #ifdef __POSIX__
   String::Utf8Value key(property);
   String::Utf8Value val(value);
@@ -1988,11 +2049,11 @@ static Handle<Value> EnvSetter(Local<String> property,
 
 static Handle<Integer> EnvQuery(Local<String> property,
                                 const AccessorInfo& info) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 #ifdef __POSIX__
   String::Utf8Value key(property);
   if (getenv(*key)) {
-    return scope.Close(Integer::New(None));
+    return scope.Close(Integer::New(0, node_isolate));
   }
 #else  // _WIN32
   String::Value key(property);
@@ -2003,9 +2064,10 @@ static Handle<Integer> EnvQuery(Local<String> property,
       // Environment variables that start with '=' are hidden and read-only.
       return scope.Close(Integer::New(v8::ReadOnly ||
                                       v8::DontDelete ||
-                                      v8::DontEnum));
+                                      v8::DontEnum,
+                                      node_isolate));
     } else {
-      return scope.Close(Integer::New(None));
+      return scope.Close(Integer::New(0, node_isolate));
     }
   }
 #endif
@@ -2016,12 +2078,12 @@ static Handle<Integer> EnvQuery(Local<String> property,
 
 static Handle<Boolean> EnvDeleter(Local<String> property,
                                   const AccessorInfo& info) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 #ifdef __POSIX__
   String::Utf8Value key(property);
-  if (!getenv(*key)) return False();
+  if (!getenv(*key)) return False(node_isolate);
   unsetenv(*key); // can't check return value, it's void on some platforms
-  return True();
+  return True(node_isolate);
 #else
   String::Value key(property);
   WCHAR* key_ptr = reinterpret_cast<WCHAR*>(*key);
@@ -2032,13 +2094,13 @@ static Handle<Boolean> EnvDeleter(Local<String> property,
               GetLastError() != ERROR_SUCCESS;
     return scope.Close(Boolean::New(rv));
   }
-  return True();
+  return True(node_isolate);
 #endif
 }
 
 
 static Handle<Array> EnvEnumerator(const AccessorInfo& info) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 #ifdef __POSIX__
   int size = 0;
   while (environ[size]) size++;
@@ -2082,19 +2144,19 @@ static Handle<Array> EnvEnumerator(const AccessorInfo& info) {
 
 
 static Handle<Object> GetFeatures() {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   Local<Object> obj = Object::New();
   obj->Set(String::NewSymbol("debug"),
 #if defined(DEBUG) && DEBUG
-    True()
+    True(node_isolate)
 #else
-    False()
+    False(node_isolate)
 #endif
   );
 
-  obj->Set(String::NewSymbol("uv"), True());
-  obj->Set(String::NewSymbol("ipv6"), True()); // TODO ping libuv
+  obj->Set(String::NewSymbol("uv"), True(node_isolate));
+  obj->Set(String::NewSymbol("ipv6"), True(node_isolate)); // TODO ping libuv
   obj->Set(String::NewSymbol("tls_npn"), Boolean::New(use_npn));
   obj->Set(String::NewSymbol("tls_sni"), Boolean::New(use_sni));
   obj->Set(String::NewSymbol("tls"),
@@ -2106,15 +2168,15 @@ static Handle<Object> GetFeatures() {
 
 static Handle<Value> DebugPortGetter(Local<String> property,
                                      const AccessorInfo& info) {
-  HandleScope scope;
-  return scope.Close(Integer::NewFromUnsigned(debug_port));
+  HandleScope scope(node_isolate);
+  return scope.Close(Integer::NewFromUnsigned(debug_port, node_isolate));
 }
 
 
 static void DebugPortSetter(Local<String> property,
                             Local<Value> value,
                             const AccessorInfo& info) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
   debug_port = value->NumberValue();
 }
 
@@ -2123,8 +2185,37 @@ static Handle<Value> DebugProcess(const Arguments& args);
 static Handle<Value> DebugPause(const Arguments& args);
 static Handle<Value> DebugEnd(const Arguments& args);
 
+
+Handle<Value> NeedImmediateCallbackGetter(Local<String> property,
+                                          const AccessorInfo& info) {
+  return Boolean::New(need_immediate_cb);
+}
+
+
+static void NeedImmediateCallbackSetter(Local<String> property,
+                                        Local<Value> value,
+                                        const AccessorInfo& info) {
+  HandleScope scope(node_isolate);
+
+  bool bool_value = value->BooleanValue();
+
+  if (need_immediate_cb == bool_value) return;
+
+  need_immediate_cb = bool_value;
+
+  if (need_immediate_cb) {
+    uv_check_start(&check_immediate_watcher, node::CheckImmediate);
+    // idle handle is needed only to maintain event loop
+    uv_idle_start(&idle_immediate_dummy, node::IdleImmediateDummy);
+  } else {
+    uv_check_stop(&check_immediate_watcher);
+    uv_idle_stop(&idle_immediate_dummy);
+  }
+}
+
+
 Handle<Object> SetupProcessObject(int argc, char *argv[]) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   int i, j;
 
@@ -2132,7 +2223,8 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
 
   process_template->SetClassName(String::NewSymbol("process"));
 
-  process = Persistent<Object>::New(process_template->GetFunction()->NewInstance());
+  process = Persistent<Object>::New(node_isolate,
+                                process_template->GetFunction()->NewInstance());
 
   process->SetAccessor(String::New("title"),
                        ProcessTitleGetter,
@@ -2142,7 +2234,7 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
   process->Set(String::NewSymbol("version"), String::New(NODE_VERSION));
 
   // process.moduleLoadList
-  module_load_list = Persistent<Array>::New(Array::New());
+  module_load_list = Persistent<Array>::New(node_isolate, Array::New());
   process->Set(String::NewSymbol("moduleLoadList"), module_load_list);
 
   // process.versions
@@ -2155,10 +2247,10 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
   versions->Set(String::NewSymbol("node"), String::New(NODE_VERSION+1));
   versions->Set(String::NewSymbol("v8"), String::New(V8::GetVersion()));
   versions->Set(String::NewSymbol("ares"), String::New(ARES_VERSION_STR));
-  versions->Set(String::NewSymbol("uv"), String::New(
-               NODE_STRINGIFY(UV_VERSION_MAJOR) "."
-               NODE_STRINGIFY(UV_VERSION_MINOR)));
+  versions->Set(String::NewSymbol("uv"), String::New(uv_version_string()));
   versions->Set(String::NewSymbol("zlib"), String::New(ZLIB_VERSION));
+  versions->Set(String::NewSymbol("modules"),
+                String::New(NODE_STRINGIFY(NODE_MODULE_VERSION)));
 #if HAVE_OPENSSL
   // Stupid code to slice out the version string.
   int c, l = strlen(OPENSSL_VERSION_TEXT);
@@ -2173,7 +2265,7 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
     }
   }
   versions->Set(String::NewSymbol("openssl"),
-                String::New(OPENSSL_VERSION_TEXT + i, j - i));
+                String::New(&OPENSSL_VERSION_TEXT[i], j - i));
 #endif
 
 
@@ -2186,10 +2278,10 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
 
   // process.argv
   Local<Array> arguments = Array::New(argc - option_end_index + 1);
-  arguments->Set(Integer::New(0), String::New(argv[0]));
+  arguments->Set(Integer::New(0, node_isolate), String::New(argv[0]));
   for (j = 1, i = option_end_index; i < argc; j++, i++) {
     Local<String> arg = String::New(argv[i]);
-    arguments->Set(Integer::New(j), arg);
+    arguments->Set(Integer::New(j, node_isolate), arg);
   }
   // assign it
   process->Set(String::NewSymbol("argv"), arguments);
@@ -2197,7 +2289,7 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
   // process.execArgv
   Local<Array> execArgv = Array::New(option_end_index - 1);
   for (j = 1, i = 0; j < option_end_index; j++, i++) {
-    execArgv->Set(Integer::New(i), String::New(argv[j]));
+    execArgv->Set(Integer::New(i, node_isolate), String::New(argv[j]));
   }
   // assign it
   process->Set(String::NewSymbol("execArgv"), execArgv);
@@ -2214,8 +2306,11 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
   Local<Object> env = envTemplate->NewInstance();
   process->Set(String::NewSymbol("env"), env);
 
-  process->Set(String::NewSymbol("pid"), Integer::New(getpid()));
+  process->Set(String::NewSymbol("pid"), Integer::New(getpid(), node_isolate));
   process->Set(String::NewSymbol("features"), GetFeatures());
+  process->SetAccessor(String::New("_needImmediateCallback"),
+                       NeedImmediateCallbackGetter,
+                       NeedImmediateCallbackSetter);
 
   // -e, --eval
   if (eval_string) {
@@ -2224,22 +2319,27 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
 
   // -p, --print
   if (print_eval) {
-    process->Set(String::NewSymbol("_print_eval"), True());
+    process->Set(String::NewSymbol("_print_eval"), True(node_isolate));
   }
 
   // -i, --interactive
   if (force_repl) {
-    process->Set(String::NewSymbol("_forceRepl"), True());
+    process->Set(String::NewSymbol("_forceRepl"), True(node_isolate));
   }
 
   // --no-deprecation
   if (no_deprecation) {
-    process->Set(String::NewSymbol("noDeprecation"), True());
+    process->Set(String::NewSymbol("noDeprecation"), True(node_isolate));
+  }
+
+  // --throw-deprecation
+  if (throw_deprecation) {
+    process->Set(String::NewSymbol("throwDeprecation"), True(node_isolate));
   }
 
   // --trace-deprecation
   if (trace_deprecation) {
-    process->Set(String::NewSymbol("traceDeprecation"), True());
+    process->Set(String::NewSymbol("traceDeprecation"), True(node_isolate));
   }
 
   size_t size = 2*PATH_MAX;
@@ -2260,7 +2360,6 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
   // define various internal methods
   NODE_SET_METHOD(process, "_getActiveRequests", GetActiveRequests);
   NODE_SET_METHOD(process, "_getActiveHandles", GetActiveHandles);
-  NODE_SET_METHOD(process, "_needTickCallback", NeedTickCallback);
   NODE_SET_METHOD(process, "reallyExit", Exit);
   NODE_SET_METHOD(process, "abort", Abort);
   NODE_SET_METHOD(process, "chdir", Chdir);
@@ -2268,13 +2367,17 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
 
   NODE_SET_METHOD(process, "umask", Umask);
 
-#ifdef __POSIX__
+#if defined(__POSIX__) && !defined(__ANDROID__)
   NODE_SET_METHOD(process, "getuid", GetUid);
   NODE_SET_METHOD(process, "setuid", SetUid);
 
   NODE_SET_METHOD(process, "setgid", SetGid);
   NODE_SET_METHOD(process, "getgid", GetGid);
-#endif // __POSIX__
+
+  NODE_SET_METHOD(process, "getgroups", GetGroups);
+  NODE_SET_METHOD(process, "setgroups", SetGroups);
+  NODE_SET_METHOD(process, "initgroups", InitGroups);
+#endif // __POSIX__ && !defined(__ANDROID__)
 
   NODE_SET_METHOD(process, "_kill", Kill);
 
@@ -2288,9 +2391,20 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
 
   NODE_SET_METHOD(process, "uptime", Uptime);
   NODE_SET_METHOD(process, "memoryUsage", MemoryUsage);
-  NODE_SET_METHOD(process, "uvCounters", UVCounters);
 
   NODE_SET_METHOD(process, "binding", Binding);
+
+  NODE_SET_METHOD(process, "_setupDomainUse", SetupDomainUse);
+
+  // values use to cross communicate with processNextTick
+  Local<Object> info_box = Object::New();
+  info_box->SetIndexedPropertiesToExternalArrayData(&tick_infobox,
+                                                    kExternalUnsignedIntArray,
+                                                    2);
+  process->Set(String::NewSymbol("_tickInfoBox"), info_box);
+
+  // pre-set _events object for faster emit checks
+  process->Set(String::NewSymbol("_events"), Object::New());
 
   return process;
 }
@@ -2303,11 +2417,14 @@ static void AtExit() {
 
 static void SignalExit(int signal) {
   uv_tty_reset_mode();
-  _exit(1);
+  _exit(128 + signal);
 }
 
 
 void Load(Handle<Object> process_l) {
+  process_symbol = NODE_PSYMBOL("process");
+  domain_symbol = NODE_PSYMBOL("domain");
+
   // Compile, execute the src/node.js file. (Which was included as static C
   // string in node_natives.h. 'natve_node' is the string containing that
   // source code.)
@@ -2317,10 +2434,15 @@ void Load(Handle<Object> process_l) {
 
   TryCatch try_catch;
 
+  // Disable verbose mode to stop FatalException() handler from trying
+  // to handle the exception. Errors this early in the start-up phase
+  // are not safe to ignore.
+  try_catch.SetVerbose(false);
+
   Local<Value> f_value = ExecuteString(MainSource(),
                                        IMMUTABLE_STRING("node.js"));
   if (try_catch.HasCaught())  {
-    ReportException(try_catch, true);
+    ReportException(try_catch);
     exit(10);
   }
   assert(f_value->IsFunction());
@@ -2336,18 +2458,25 @@ void Load(Handle<Object> process_l) {
 
   // Add a reference to the global object
   Local<Object> global = v8::Context::GetCurrent()->Global();
-  Local<Value> args[1] = { Local<Value>::New(process_l) };
+  Local<Value> args[1] = { Local<Value>::New(node_isolate, process_l) };
 
-#if defined HAVE_DTRACE || defined HAVE_ETW
+#if defined HAVE_DTRACE || defined HAVE_ETW || defined HAVE_SYSTEMTAP
   InitDTrace(global);
 #endif
 
-  f->Call(global, 1, args);
+#if defined HAVE_PERFCTR
+  InitPerfCounters(global);
+#endif
 
-  if (try_catch.HasCaught())  {
-    ReportException(try_catch, true);
-    exit(11);
-  }
+  // Enable handling of uncaught exceptions
+  // (FatalException(), break on uncaught exception in debugger)
+  //
+  // This is not strictly necessary since it's almost impossible
+  // to attach the debugger fast enought to break on exception
+  // thrown during process startup.
+  try_catch.SetVerbose(true);
+
+  f->Call(global, 1, args);
 }
 
 static void PrintHelp();
@@ -2355,19 +2484,24 @@ static void PrintHelp();
 static void ParseDebugOpt(const char* arg) {
   const char *p = 0;
 
-  use_debug_agent = true;
-  if (!strcmp (arg, "--debug-brk")) {
-    debug_wait_connect = true;
-    return;
-  } else if (!strcmp(arg, "--debug")) {
-    return;
-  } else if (strstr(arg, "--debug-brk=") == arg) {
-    debug_wait_connect = true;
+  if (strstr(arg, "--debug-port=") == arg) {
     p = 1 + strchr(arg, '=');
     debug_port = atoi(p);
-  } else if (strstr(arg, "--debug=") == arg) {
-    p = 1 + strchr(arg, '=');
-    debug_port = atoi(p);
+  } else {
+    use_debug_agent = true;
+    if (!strcmp (arg, "--debug-brk")) {
+      debug_wait_connect = true;
+      return;
+    } else if (!strcmp(arg, "--debug")) {
+      return;
+    } else if (strstr(arg, "--debug-brk=") == arg) {
+      debug_wait_connect = true;
+      p = 1 + strchr(arg, '=');
+      debug_port = atoi(p);
+    } else if (strstr(arg, "--debug=") == arg) {
+      p = 1 + strchr(arg, '=');
+      debug_port = atoi(p);
+    }
   }
   if (p && debug_port > 1024 && debug_port <  65536)
       return;
@@ -2376,7 +2510,7 @@ static void ParseDebugOpt(const char* arg) {
   if (p) fprintf(stderr, "Debug port must be in range 1025 to 65535.\n");
 
   PrintHelp();
-  exit(1);
+  exit(12);
 }
 
 static void PrintHelp() {
@@ -2386,7 +2520,7 @@ static void PrintHelp() {
          "Options:\n"
          "  -v, --version        print node's version\n"
          "  -e, --eval script    evaluate script\n"
-         "  -p, --print          print result of --eval\n"
+         "  -p, --print          evaluate script and print result\n"
          "  -i, --interactive    always enter the REPL even if stdin\n"
          "                       does not appear to be a terminal\n"
          "  --no-deprecation     silence deprecation warnings\n"
@@ -2407,6 +2541,7 @@ static void PrintHelp() {
          "\n"
          "Documentation can be found at http://nodejs.org/\n");
 }
+
 
 // Parse node command line arguments.
 static void ParseArgs(int argc, char **argv) {
@@ -2429,20 +2564,36 @@ static void ParseArgs(int argc, char **argv) {
     } else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
       PrintHelp();
       exit(0);
-    } else if (strcmp(arg, "--eval") == 0 || strcmp(arg, "-e") == 0 ||
-        strcmp(arg, "-pe") == 0) {
-      if (argc <= i + 1) {
-        fprintf(stderr, "Error: --eval requires an argument\n");
-        exit(1);
+    } else if (strcmp(arg, "--eval") == 0   ||
+               strcmp(arg, "-e") == 0       ||
+               strcmp(arg, "--print") == 0  ||
+               strcmp(arg, "-pe") == 0      ||
+               strcmp(arg, "-p") == 0) {
+      bool is_eval = strchr(arg, 'e') != NULL;
+      bool is_print = strchr(arg, 'p') != NULL;
+
+      // argument to -p and --print is optional
+      if (is_eval == true && i + 1 >= argc) {
+        fprintf(stderr, "Error: %s requires an argument\n", arg);
+        exit(13);
       }
-      if (arg[1] == 'p') {
-        print_eval = true;
-      }
+
+      print_eval = print_eval || is_print;
       argv[i] = const_cast<char*>("");
+
+      // --eval, -e and -pe always require an argument
+      if (is_eval == true) {
+        eval_string = argv[++i];
+        continue;
+      }
+
+      // next arg is the expression to evaluate unless it starts with:
+      //  - a dash, then it's another switch
+      //  - "\\-", then it's an escaped expression, drop the backslash
+      if (argv[i + 1] == NULL) continue;
+      if (argv[i + 1][0] == '-') continue;
       eval_string = argv[++i];
-    } else if (strcmp(arg, "--print") == 0 || strcmp(arg, "-p") == 0) {
-      print_eval = true;
-      argv[i] = const_cast<char*>("");
+      if (strncmp(eval_string, "\\-", 2) == 0) ++eval_string;
     } else if (strcmp(arg, "--interactive") == 0 || strcmp(arg, "-i") == 0) {
       force_repl = true;
       argv[i] = const_cast<char*>("");
@@ -2454,6 +2605,9 @@ static void ParseArgs(int argc, char **argv) {
     } else if (strcmp(arg, "--trace-deprecation") == 0) {
       argv[i] = const_cast<char*>("");
       trace_deprecation = true;
+    } else if (strcmp(arg, "--throw-deprecation") == 0) {
+      argv[i] = const_cast<char*>("");
+      throw_deprecation = true;
     } else if (argv[i][0] != '-') {
       break;
     }
@@ -2463,13 +2617,41 @@ static void ParseArgs(int argc, char **argv) {
 }
 
 
-static Isolate* node_isolate = NULL;
-static volatile bool debugger_running = false;
+// Called from the main thread.
+static void DispatchDebugMessagesAsyncCallback(uv_async_t* handle, int status) {
+  v8::Debug::ProcessDebugMessages();
+}
+
+
+// Called from V8 Debug Agent TCP thread.
+static void DispatchMessagesDebugAgentCallback() {
+  uv_async_send(&dispatch_debug_messages_async);
+}
+
+
+// Called from the main thread
+static void EmitDebugEnabledAsyncCallback(uv_async_t* handle, int status) {
+  HandleScope handle_scope(node_isolate);
+  Local<Object> obj = Object::New();
+  obj->Set(String::New("cmd"), String::New("NODE_DEBUG_ENABLED"));
+  Local<Value> args[] = { String::New("internalMessage"), obj };
+  MakeCallback(process, "emit", ARRAY_SIZE(args), args);
+}
+
+
+// Called from the signal watcher callback
+static void EmitDebugEnabled() {
+  uv_async_send(&emit_debug_enabled_async);
+}
+
 
 static void EnableDebug(bool wait_connect) {
   // If we're called from another thread, make sure to enter the right
   // v8 isolate.
   node_isolate->Enter();
+
+  v8::Debug::SetDebugMessageDispatchHandler(DispatchMessagesDebugAgentCallback,
+                                            false);
 
   // Start the debug thread and it's associated TCP server on port 5858.
   bool r = v8::Debug::EnableAgent("node " NODE_VERSION,
@@ -2485,12 +2667,17 @@ static void EnableDebug(bool wait_connect) {
 
   debugger_running = true;
 
+  // Do not emit NODE_DEBUG_ENABLED when debugger is enabled before starting
+  // the main process (i.e. when called via `node --debug`)
+  if (!process.IsEmpty())
+    EmitDebugEnabled();
+
   node_isolate->Exit();
 }
 
 
 #ifdef __POSIX__
-static void EnableDebugSignalHandler(int signal) {
+static void EnableDebugSignalHandler(uv_signal_t* handle, int) {
   // Break once process will return execution to v8
   v8::Debug::DebugBreak(node_isolate);
 
@@ -2512,7 +2699,7 @@ static void RegisterSignalHandler(int signal, void (*handler)(int)) {
 
 
 Handle<Value> DebugProcess(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   if (args.Length() != 1) {
     return ThrowException(Exception::Error(
@@ -2528,7 +2715,7 @@ Handle<Value> DebugProcess(const Arguments& args) {
     return ThrowException(ErrnoException(errno, "kill"));
   }
 
-  return Undefined();
+  return Undefined(node_isolate);
 }
 #endif // __POSIX__
 
@@ -2544,7 +2731,7 @@ DWORD WINAPI EnableDebugThreadProc(void* arg) {
     }
   }
 
-  v8::Debug::DebugBreak();
+  v8::Debug::DebugBreak(node_isolate);
 
   return 0;
 }
@@ -2600,8 +2787,8 @@ static int RegisterDebugSignalHandler() {
 
 
 static Handle<Value> DebugProcess(const Arguments& args) {
-  HandleScope scope;
-  Handle<Value> rv = Undefined();
+  HandleScope scope(node_isolate);
+  Handle<Value> rv = Undefined(node_isolate);
   DWORD pid;
   HANDLE process = NULL;
   HANDLE thread = NULL;
@@ -2685,14 +2872,14 @@ static Handle<Value> DebugProcess(const Arguments& args) {
     CloseHandle(mapping);
   }
 
-  return Undefined();
+  return Undefined(node_isolate);
 }
 #endif // _WIN32
 
 
 static Handle<Value> DebugPause(const Arguments& args) {
   v8::Debug::DebugBreak(node_isolate);
-  return Undefined();
+  return Undefined(node_isolate);
 }
 
 
@@ -2702,7 +2889,7 @@ static Handle<Value> DebugEnd(const Arguments& args) {
     debugger_running = false;
   }
 
-  return Undefined();
+  return Undefined(node_isolate);
 }
 
 
@@ -2712,6 +2899,18 @@ char** Init(int argc, char *argv[]) {
 
   // Make inherited handles noninheritable.
   uv_disable_stdio_inheritance();
+
+  // init async debug messages dispatching
+  uv_async_init(uv_default_loop(),
+                &dispatch_debug_messages_async,
+                DispatchDebugMessagesAsyncCallback);
+  uv_unref(reinterpret_cast<uv_handle_t*>(&dispatch_debug_messages_async));
+
+  // init async NODE_DEBUG_ENABLED emitter
+  uv_async_init(uv_default_loop(),
+                &emit_debug_enabled_async,
+                EmitDebugEnabledAsyncCallback);
+  uv_unref(reinterpret_cast<uv_handle_t*>(&emit_debug_enabled_async));
 
   // Parse a few arguments which are specific to Node.
   node::ParseArgs(argc, argv);
@@ -2726,7 +2925,7 @@ char** Init(int argc, char *argv[]) {
     // a breakpoint on the first line of the startup script
     v8argc += 2;
     v8argv = new char*[v8argc];
-    memcpy(v8argv, argv, sizeof(argv) * option_end_index);
+    memcpy(v8argv, argv, sizeof(*argv) * option_end_index);
     v8argv[option_end_index] = const_cast<char*>("--expose_debug_as");
     v8argv[option_end_index + 1] = const_cast<char*>("v8debug");
   }
@@ -2746,6 +2945,10 @@ char** Init(int argc, char *argv[]) {
   }
   V8::SetFlagsFromCommandLine(&v8argc, v8argv, false);
 
+  // Fetch a reference to the main isolate, so we have a reference to it
+  // even when we need it to access it from another (debugger) thread.
+  node_isolate = Isolate::GetCurrent();
+
 #ifdef __POSIX__
   // Ignore SIGPIPE
   RegisterSignalHandler(SIGPIPE, SIG_IGN);
@@ -2753,31 +2956,14 @@ char** Init(int argc, char *argv[]) {
   RegisterSignalHandler(SIGTERM, SignalExit);
 #endif // __POSIX__
 
-  uv_prepare_init(uv_default_loop(), &prepare_tick_watcher);
-  uv_prepare_start(&prepare_tick_watcher, PrepareTick);
-  uv_unref(reinterpret_cast<uv_handle_t*>(&prepare_tick_watcher));
-
-  uv_check_init(uv_default_loop(), &check_tick_watcher);
-  uv_check_start(&check_tick_watcher, node::CheckTick);
-  uv_unref(reinterpret_cast<uv_handle_t*>(&check_tick_watcher));
-
   uv_idle_init(uv_default_loop(), &tick_spinner);
 
-  uv_check_init(uv_default_loop(), &gc_check);
-  uv_check_start(&gc_check, node::Check);
-  uv_unref(reinterpret_cast<uv_handle_t*>(&gc_check));
-
-  uv_idle_init(uv_default_loop(), &gc_idle);
-  uv_unref(reinterpret_cast<uv_handle_t*>(&gc_idle));
-
-  uv_timer_init(uv_default_loop(), &gc_timer);
-  uv_unref(reinterpret_cast<uv_handle_t*>(&gc_timer));
+  uv_check_init(uv_default_loop(), &check_immediate_watcher);
+  uv_unref(reinterpret_cast<uv_handle_t*>(&check_immediate_watcher));
+  uv_idle_init(uv_default_loop(), &idle_immediate_dummy);
 
   V8::SetFatalErrorHandler(node::OnFatalError);
-
-  // Fetch a reference to the main isolate, so we have a reference to it
-  // even when we need it to access it from another (debugger) thread.
-  node_isolate = Isolate::GetCurrent();
+  V8::AddMessageListener(OnMessage);
 
   // If the --debug flag was specified then initialize the debug thread.
   if (use_debug_agent) {
@@ -2786,7 +2972,10 @@ char** Init(int argc, char *argv[]) {
 #ifdef _WIN32
     RegisterDebugSignalHandler();
 #else // Posix
-    RegisterSignalHandler(SIGUSR1, EnableDebugSignalHandler);
+    static uv_signal_t signal_watcher;
+    uv_signal_init(uv_default_loop(), &signal_watcher);
+    uv_signal_start(&signal_watcher, EnableDebugSignalHandler, SIGUSR1);
+    uv_unref(reinterpret_cast<uv_handle_t*>(&signal_watcher));
 #endif // __POSIX__
   }
 
@@ -2827,16 +3016,9 @@ void AtExit(void (*cb)(void* arg), void* arg) {
 
 void EmitExit(v8::Handle<v8::Object> process_l) {
   // process.emit('exit')
-  process_l->Set(String::NewSymbol("_exiting"), True());
-  Local<Value> emit_v = process_l->Get(String::New("emit"));
-  assert(emit_v->IsFunction());
-  Local<Function> emit = Local<Function>::Cast(emit_v);
-  Local<Value> args[] = { String::New("exit"), Integer::New(0) };
-  TryCatch try_catch;
-  emit->Call(process_l, 2, args);
-  if (try_catch.HasCaught()) {
-    FatalException(try_catch);
-  }
+  process_l->Set(String::NewSymbol("_exiting"), True(node_isolate));
+  Local<Value> args[] = { String::New("exit"), Integer::New(0, node_isolate) };
+  MakeCallback(process, "emit", ARRAY_SIZE(args), args);
 }
 
 static char **copy_argv(int argc, char **argv) {
@@ -2884,15 +3066,12 @@ int Start(int argc, char *argv[]) {
 
   V8::Initialize();
   {
-    Locker locker;
-    HandleScope handle_scope;
+    Locker locker(node_isolate);
+    HandleScope handle_scope(node_isolate);
 
     // Create the one and only Context.
-    Persistent<Context> context = Context::New();
+    Local<Context> context = Context::New(node_isolate);
     Context::Scope context_scope(context);
-
-    process_symbol = NODE_PSYMBOL("process");
-    domain_symbol = NODE_PSYMBOL("domain");
 
     // Use original argv, as we're just copying values out of it.
     Handle<Object> process_l = SetupProcessObject(argc, argv);
@@ -2907,14 +3086,10 @@ int Start(int argc, char *argv[]) {
     // there are no watchers on the loop (except for the ones that were
     // uv_unref'd) then this function exits. As long as there are active
     // watchers, it blocks.
-    uv_run(uv_default_loop());
+    uv_run(uv_default_loop(), UV_RUN_DEFAULT);
 
     EmitExit(process_l);
     RunAtExit();
-
-#ifndef NDEBUG
-    context.Dispose();
-#endif
   }
 
 #ifndef NDEBUG

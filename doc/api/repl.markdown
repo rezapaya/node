@@ -135,6 +135,27 @@ Example of listening for `exit`:
     });
 
 
+### Event: 'reset'
+
+`function (context) {}`
+
+Emitted when the REPL's context is reset. This happens when you type `.clear`.
+If you start the repl with `{ useGlobal: true }` then this event will never
+be emitted.
+
+Example of listening for `reset`:
+
+    // Extend the initial repl context.
+    r = repl.start({ options ... });
+    someExtension.extend(r.context);
+
+    // When a new context is created extend it as well.
+    r.on('reset', function (context) {
+      console.log('repl has a new context');
+      someExtension.extend(context);
+    });
+
+
 ## REPL Features
 
 <!-- type=misc -->
@@ -159,7 +180,7 @@ associated with each `REPLServer`.  For example:
     var repl = require("repl"),
         msg = "message";
 
-    repl.start().context.m = msg;
+    repl.start("> ").context.m = msg;
 
 Things in the `context` object appear as local within the REPL:
 

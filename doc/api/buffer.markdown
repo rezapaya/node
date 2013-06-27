@@ -19,9 +19,6 @@ encoding method.  Here are the different string encodings.
 
 * `'ascii'` - for 7 bit ASCII data only.  This encoding method is very fast, and
   will strip the high bit if set.
-  Note that this encoding converts a null character (`'\0'` or `'\u0000'`) into
-  `0x20` (character code of a space). If you want to convert a null character
-  into `0x00`, you should use `'utf8'`.
 
 * `'utf8'` - Multibyte encoded Unicode characters. Many web pages and other
   document formats use UTF-8.
@@ -39,6 +36,17 @@ encoding method.  Here are the different string encodings.
   will be removed in future versions of Node.
 
 * `'hex'` - Encode each byte as two hexadecimal characters.
+
+A `Buffer` object can also be used with typed arrays.  The buffer object is
+cloned to an `ArrayBuffer` that is used as the backing store for the typed
+array.  The memory of the buffer and the `ArrayBuffer` is not shared.
+
+NOTE: Node.js v0.8 simply retained a reference to the buffer in `array.buffer`
+instead of cloning it.
+
+While more efficient, it introduces subtle incompatibilities with the typed
+arrays specification.  `ArrayBuffer#slice()` makes a copy of the slice while
+`Buffer#slice()` creates a view.
 
 ## Class: Buffer
 
@@ -65,62 +73,12 @@ Allocates a new buffer using an `array` of octets.
 Allocates a new buffer containing the given `str`.
 `encoding` defaults to `'utf8'`.
 
-### buf.write(string, [offset], [length], [encoding])
+### Class Method: Buffer.isEncoding(encoding)
 
-* `string` String - data to be written to buffer
-* `offset` Number, Optional, Default: 0
-* `length` Number, Optional, Default: `buffer.length - offset`
-* `encoding` String, Optional, Default: 'utf8'
+* `encoding` {String} The encoding string to test
 
-Writes `string` to the buffer at `offset` using the given encoding.
-`offset` defaults to `0`, `encoding` defaults to `'utf8'`. `length` is
-the number of bytes to write. Returns number of octets written. If `buffer` did
-not contain enough space to fit the entire string, it will write a partial
-amount of the string. `length` defaults to `buffer.length - offset`.
-The method will not write partial characters.
-
-    buf = new Buffer(256);
-    len = buf.write('\u00bd + \u00bc = \u00be', 0);
-    console.log(len + " bytes: " + buf.toString('utf8', 0, len));
-
-The number of characters written (which may be different than the number of
-bytes written) is set in `Buffer._charsWritten` and will be overwritten the
-next time `buf.write()` is called.
-
-
-### buf.toString([encoding], [start], [end])
-
-* `encoding` String, Optional, Default: 'utf8'
-* `start` Number, Optional, Default: 0
-* `end` Number, Optional, Default: `buffer.length`
-
-Decodes and returns a string from buffer data encoded with `encoding`
-(defaults to `'utf8'`) beginning at `start` (defaults to `0`) and ending at
-`end` (defaults to `buffer.length`).
-
-See `buffer.write()` example, above.
-
-
-### buf[index]
-
-<!--type=property-->
-<!--name=[index]-->
-
-Get and set the octet at `index`. The values refer to individual bytes,
-so the legal range is between `0x00` and `0xFF` hex or `0` and `255`.
-
-Example: copy an ASCII string into a buffer, one byte at a time:
-
-    str = "node.js";
-    buf = new Buffer(str.length);
-
-    for (var i = 0; i < str.length ; i++) {
-      buf[i] = str.charCodeAt(i);
-    }
-
-    console.log(buf);
-
-    // node.js
+Returns true if the `encoding` is a valid encoding argument, or false
+otherwise.
 
 ### Class Method: Buffer.isBuffer(obj)
 
@@ -168,6 +126,46 @@ If totalLength is not provided, it is read from the buffers in the list.
 However, this adds an additional loop to the function, so it is faster
 to provide the length explicitly.
 
+### Class Method: Buffer.alloc(length, [receiver])
+
+* `length` Number
+* `receiver` Object, Optional, Default: `new Object`
+
+
+**(EXPERIMENTAL)** Returns object with allocated external array data.
+
+Buffers are backed by a simple allocator that only handles the assignation of
+external raw memory. This exposes that functionality.
+
+No pooling is performed for these allocations. So there's no form of memory
+leak.
+
+This can be used to create your own Buffer-like classes.
+
+    function SimpleData(n) {
+      this.length = n;
+      Buffer.alloc(this.length, this);
+    }
+
+    SimpleData.prototype = { /* ... */ };
+
+### Class Method: Buffer.dispose(obj)
+
+* `obj` Object
+
+
+**(EXPERIMENTAL)** Free memory that has been allocated to an object via
+`Buffer.alloc`.
+
+    var a = {};
+    Buffer.alloc(3, a);
+
+    // { '0': 0, '1': 0, '2': 0 }
+
+    Buffer.dispose(a);
+
+    // {}
+
 ### buf.length
 
 * Number
@@ -185,6 +183,81 @@ buffer object.  It does not change when the contents of the buffer are changed.
     // 1234
     // 1234
 
+### buf.write(string, [offset], [length], [encoding])
+
+* `string` String - data to be written to buffer
+* `offset` Number, Optional, Default: 0
+* `length` Number, Optional, Default: `buffer.length - offset`
+* `encoding` String, Optional, Default: 'utf8'
+
+Writes `string` to the buffer at `offset` using the given encoding.
+`offset` defaults to `0`, `encoding` defaults to `'utf8'`. `length` is
+the number of bytes to write. Returns number of octets written. If `buffer` did
+not contain enough space to fit the entire string, it will write a partial
+amount of the string. `length` defaults to `buffer.length - offset`.
+The method will not write partial characters.
+
+    buf = new Buffer(256);
+    len = buf.write('\u00bd + \u00bc = \u00be', 0);
+    console.log(len + " bytes: " + buf.toString('utf8', 0, len));
+
+
+### buf.toString([encoding], [start], [end])
+
+* `encoding` String, Optional, Default: 'utf8'
+* `start` Number, Optional, Default: 0
+* `end` Number, Optional, Default: `buffer.length`
+
+Decodes and returns a string from buffer data encoded with `encoding`
+(defaults to `'utf8'`) beginning at `start` (defaults to `0`) and ending at
+`end` (defaults to `buffer.length`).
+
+See `buffer.write()` example, above.
+
+
+### buf.toJSON()
+
+Returns a JSON-representation of the Buffer instance.  `JSON.stringify`
+implicitly calls this function when stringifying a Buffer instance.
+
+Example:
+
+    var buf = new Buffer('test');
+    var json = JSON.stringify(buf);
+
+    console.log(json);
+    // '{"type":"Buffer","data":[116,101,115,116]}'
+
+    var copy = JSON.parse(json, function(key, value) {
+        return value && value.type === 'Buffer'
+          ? new Buffer(value.data)
+          : value;
+      });
+
+    console.log(copy);
+    // <Buffer 74 65 73 74>
+
+### buf[index]
+
+<!--type=property-->
+<!--name=[index]-->
+
+Get and set the octet at `index`. The values refer to individual bytes,
+so the legal range is between `0x00` and `0xFF` hex or `0` and `255`.
+
+Example: copy an ASCII string into a buffer, one byte at a time:
+
+    str = "node.js";
+    buf = new Buffer(str.length);
+
+    for (var i = 0; i < str.length ; i++) {
+      buf[i] = str.charCodeAt(i);
+    }
+
+    console.log(buf);
+
+    // node.js
+
 ### buf.copy(targetBuffer, [targetStart], [sourceStart], [sourceEnd])
 
 * `targetBuffer` Buffer object - Buffer to copy into
@@ -195,6 +268,9 @@ buffer object.  It does not change when the contents of the buffer are changed.
 Does copy between buffers. The source and target regions can be overlapped.
 `targetStart` and `sourceStart` default to `0`.
 `sourceEnd` defaults to `buffer.length`.
+
+All values passed that are `undefined`/`NaN` or are out of bounds are set equal
+to their respective defaults.
 
 Example: build two Buffers, then copy `buf1` from byte 16 through byte 19
 into `buf2`, starting at the 8th byte in `buf2`.
@@ -220,7 +296,7 @@ into `buf2`, starting at the 8th byte in `buf2`.
 
 Returns a new buffer which references the same memory as the old, but offset
 and cropped by the `start` (defaults to `0`) and `end` (defaults to
-`buffer.length`) indexes.
+`buffer.length`) indexes.  Negative indexes start from the end of the buffer.
 
 **Modifying the new buffer slice will modify memory in the original buffer!**
 
@@ -583,7 +659,7 @@ complement signed integer into `buffer`.
 * `noAssert` Boolean, Optional, Default: false
 
 Writes `value` to the buffer at the specified offset with specified endian
-format. Note, `value` must be a valid 32 bit float.
+format. Note, behavior is unspecified if `value` is not a 32 bit float.
 
 Set `noAssert` to true to skip validation of `value` and `offset`. This means
 that `value` may be too large for the specific function and `offset` may be
@@ -658,11 +734,28 @@ Note that this is a property on the buffer module returned by
 
 ## Class: SlowBuffer
 
-This class is primarily for internal use.  JavaScript programs should
-use Buffer instead of using SlowBuffer.
+Returns an un-pooled `Buffer`.
 
-In order to avoid the overhead of allocating many C++ Buffer objects for
-small blocks of memory in the lifetime of a server, Node allocates memory
-in 8Kb (8192 byte) chunks.  If a buffer is smaller than this size, then it
-will be backed by a parent SlowBuffer object.  If it is larger than this,
-then Node will allocate a SlowBuffer slab for it directly.
+In order to avoid the garbage collection overhead of creating many individually
+allocated Buffers, by default allocations under 4KB are sliced from a single
+larger allocated object. This approach improves both performance and memory
+usage since v8 does not need to track and cleanup as many `Persistent` objects.
+
+In the case where a developer may need to retain a small chunk of memory from a
+pool for an indeterminate amount of time it may be appropriate to create an
+un-pooled Buffer instance using SlowBuffer and copy out the relevant bits.
+
+    // need to keep around a few small chunks of memory
+    var store = [];
+
+    socket.on('readable', function() {
+      var data = socket.read();
+      // allocate for retained data
+      var sb = new SlowBuffer(10);
+      // copy the data into the new allocation
+      data.copy(sb, 0, 0, 10);
+      store.push(sb);
+    });
+
+Though this should used sparingly and only be a last resort *after* a developer
+has actively observed undue memory retention in their applications.

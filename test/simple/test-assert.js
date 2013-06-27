@@ -283,3 +283,26 @@ testAssertionMessage({a: undefined, b: null}, '{"a":"undefined","b":null}');
 testAssertionMessage({a: NaN, b: Infinity, c: -Infinity},
     '{"a":"NaN","b":"Infinity","c":"-Infinity"}');
 
+// #2893
+try {
+  assert.throws(function () {
+    assert.ifError(null);
+  });
+} catch (e) {
+  threw = true;
+  assert.equal(e.message, 'Missing expected exception..');
+}
+assert.ok(threw);
+
+// #5292
+try {
+  assert.equal(1, 2);
+} catch (e) {
+  assert.equal(e.toString().split('\n')[0], 'AssertionError: 1 == 2')
+}
+
+try {
+  assert.equal(1, 2, 'oh no');
+} catch (e) {
+  assert.equal(e.toString().split('\n')[0], 'AssertionError: oh no')
+}

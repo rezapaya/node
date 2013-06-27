@@ -18,6 +18,21 @@
       font-size: 14px;
       line-height:24px;
     }
+    #column1 li p + ul {
+      margin-top:-1em;
+    }
+    #column1 ul li ul {
+      font-size:12px;
+      line-height:24px;
+      padding-left: 0;
+    }
+    #column1 ul li ul li {
+      list-style:none;
+      margin-left:0;
+    }
+    #column1 ul li ul li:before {
+      content: "- ";
+    }
     #content #column1 p.meta, #content #column1 p.respond {
       font-size: 14px;
       line-height: 24px;
@@ -66,12 +81,12 @@
       <ul>
         <li><a href="http://nodejs.org/" class="home">Home</a></li>
 
-        <li><a href="http://nodejs.org/#download" class=
+        <li><a href="http://nodejs.org/download/" class=
         "download">Download</a></li>
 
         <li><a href="http://nodejs.org/about/" class="about">About</a></li>
 
-        <li><a href="http://search.npmjs.org/" class="npm">npm
+        <li><a href="http://npmjs.org/" class="npm">npm
         Registry</a></li>
 
         <li><a href="http://nodejs.org/api/" class="docs">Docs</a></li>
@@ -95,16 +110,21 @@
       <% if (typeof post !== 'undefined') {
         // just one post on this page
         %>
-        <p class="meta"><%=
-          post.author + ' - ' +
-          post.date.toUTCString().replace(/ GMT$/, '') + ' - '
-          %><a href="/<%= post.category %>/"><%= post.category %></a></p>
+        <p class="meta"><%-
+          post.date.toUTCString().replace(/ GMT$/, '') + ' UTC' +
+          (post.author ? ' - ' + post.author : '') +
+          (post.category ? ' - <a href="/' + post.category + '/">' +
+                            post.category + '</a>' : '')
+          %></p>
 
           <%- post.content %>
 
           <p class="respond">Please post feedback and comments on
             <a href="https://groups.google.com/group/nodejs">the Node.JS
-              user mailing list</a>.</p>
+              user mailing list</a>.<br>
+            Please post bugs and feature requests on
+            <a href="https://github.com/joyent/node/issues">the Node.JS
+              github repository</a>.</p>
 
           <%
           if (post.next || post.prev) {
@@ -152,10 +172,14 @@
               %>" class="permalink"><%-
                 post.title
               %></a></h1>
-              <p class="meta"><%=
-                post.author + ' - ' +
-                post.date.toUTCString().replace(/ GMT$/, '') + ' - '
-                %><a href="/<%= post.category %>/"><%= post.category %></a></p>
+
+              <p class="meta"><%-
+                post.date.toUTCString().replace(/ GMT$/, '') + ' UTC' +
+                (post.author ? ' - ' + post.author : '') +
+                (post.category ? ' - <a href="/' + post.category + '/">' +
+                                  post.category + '</a>' : '')
+                %></p>
+
               <%- post.content %>
             </div>
             <%
@@ -184,15 +208,16 @@
   </div>
 
   <div id="footer">
+      <a href="http://joyent.com" class="joyent-logo">Joyent</a>
       <ul class="clearfix">
-          <li><a href="/">Node.js</a></li>
-          <li><a href="/#download">Download</a></li>
-          <li><a href="/about/">About</a></li>
-          <li><a href="http://search.npmjs.org/">npm Registry</a></li>
+          <li><a href="http://nodejs.org/">Node.js</a></li>
+          <li><a href="http://nodejs.org/download/">Download</a></li>
+          <li><a href="http://nodejs.org/about/">About</a></li>
+          <li><a href="http://npmjs.org/">npm Registry</a></li>
           <li><a href="http://nodejs.org/api/">Docs</a></li>
           <li><a href="http://blog.nodejs.org">Blog</a></li>
-          <li><a href="/community/">Community</a></li>
-          <li><a href="/logos/">Logos</a></li>
+          <li><a href="http://nodejs.org/community/">Community</a></li>
+          <li><a href="https://nodejs.org/logos/">Logos</a></li>
           <li><a href="http://jobs.nodejs.org/">Jobs</a></li>
           <li><a href="http://twitter.com/nodejs" class="twitter">@nodejs</a></li>
       </ul>

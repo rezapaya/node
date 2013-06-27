@@ -25,7 +25,7 @@
 // bootstrapping the node.js core. Special caution is given to the performance
 // of the startup process, so many dependencies are invoked lazily.
 (function(process) {
-  global = this;
+  this.global = this;
 
   function startup() {
     var EventEmitter = NativeModule.require('events').EventEmitter;
@@ -35,8 +35,12 @@
         value: process.constructor
       }
     });
+    EventEmitter.call(process);
 
     process.EventEmitter = EventEmitter; // process.EventEmitter is deprecated
+
+    // do this good and early, since it handles errors.
+    startup.processFatal();
 
     startup.globalVariables();
     startup.globalTimeouts();
@@ -73,7 +77,7 @@
 
     } else if (process._eval != null) {
       // User passed '-e' or '--eval' arguments to Node.
-      evalScript('eval');
+      evalScript('[eval]');
     } else if (process.argv[1]) {
       // make process.argv[1] into a full path
       var path = NativeModule.require('path');
@@ -107,13 +111,12 @@
         // global.v8debug object about a connection, and runMain when
         // that occurs.  --isaacs
 
-        setTimeout(Module.runMain, 50);
+        var debugTimeout = +process.env.NODE_DEBUG_TIMEOUT || 50;
+        setTimeout(Module.runMain, debugTimeout);
 
       } else {
-        // REMOVEME: nextTick should not be necessary. This hack to get
-        // test/simple/test-exception-handler2.js working.
         // Main entry point into most programs:
-        process.nextTick(Module.runMain);
+        Module.runMain();
       }
 
     } else {
@@ -139,7 +142,6 @@
 
       } else {
         // Read all of stdin - execute it.
-        process.stdin.resume();
         process.stdin.setEncoding('utf8');
 
         var code = '';
@@ -161,6 +163,8 @@
     global.GLOBAL = global;
     global.root = global;
     global.Buffer = NativeModule.require('buffer').Buffer;
+    process.domain = null;
+    process._exiting = false;
   };
 
   startup.globalTimeouts = function() {
@@ -183,6 +187,16 @@
       var t = NativeModule.require('timers');
       return t.clearInterval.apply(this, arguments);
     };
+
+    global.setImmediate = function() {
+      var t = NativeModule.require('timers');
+      return t.setImmediate.apply(this, arguments);
+    };
+
+    global.clearImmediate = function() {
+      var t = NativeModule.require('timers');
+      return t.clearImmediate.apply(this, arguments);
+    };
   };
 
   startup.globalConsole = function() {
@@ -199,6 +213,80 @@
       startup._lazyConstants = process.binding('constants');
     }
     return startup._lazyConstants;
+  };
+
+  startup.processFatal = function() {
+    // call into the active domain, or emit uncaughtException,
+    // and exit if there are no listeners.
+    process._fatalException = function(er) {
+      var caught = false;
+      if (process.domain) {
+        var domain = process.domain;
+        var domainModule = NativeModule.require('domain');
+        var domainStack = domainModule._stack;
+
+        // ignore errors on disposed domains.
+        //
+        // XXX This is a bit stupid.  We should probably get rid of
+        // domain.dispose() altogether.  It's almost always a terrible
+        // idea.  --isaacs
+        if (domain._disposed)
+          return true;
+
+        er.domain = domain;
+        er.domainThrown = true;
+        // wrap this in a try/catch so we don't get infinite throwing
+        try {
+          // One of three things will happen here.
+          //
+          // 1. There is a handler, caught = true
+          // 2. There is no handler, caught = false
+          // 3. It throws, caught = false
+          //
+          // If caught is false after this, then there's no need to exit()
+          // the domain, because we're going to crash the process anyway.
+          caught = domain.emit('error', er);
+
+          // Exit all domains on the stack.  Uncaught exceptions end the
+          // current tick and no domains should be left on the stack
+          // between ticks.
+          var domainModule = NativeModule.require('domain');
+          domainStack.length = 0;
+          domainModule.active = process.domain = null;
+        } catch (er2) {
+          // The domain error handler threw!  oh no!
+          // See if another domain can catch THIS error,
+          // or else crash on the original one.
+          // If the user already exited it, then don't double-exit.
+          if (domain === domainModule.active)
+            domainStack.pop();
+          if (domainStack.length) {
+            var parentDomain = domainStack[domainStack.length - 1];
+            process.domain = domainModule.active = parentDomain;
+            caught = process._fatalException(er2);
+          } else
+            caught = false;
+        }
+      } else {
+        caught = process.emit('uncaughtException', er);
+      }
+      // if someone handled it, then great.  otherwise, die in C++ land
+      // since that means that we'll exit the process, emit the 'exit' event
+      if (!caught) {
+        try {
+          if (!process._exiting) {
+            process._exiting = true;
+            process.emit('exit', 1);
+          }
+        } catch (er) {
+          // nothing to be done about it at this point.
+        }
+      }
+      // if we handled an error, then make sure any ticks get processed
+      if (caught)
+        setImmediate(process._tickCallback);
+      return caught;
+    };
   };
 
   var assert;
@@ -224,39 +312,127 @@
       if (value === 'false') return false;
       return value;
     });
-  }
+  };
 
   startup.processNextTick = function() {
+    var lastThrew = false;
     var nextTickQueue = [];
-    var nextTickIndex = 0;
+    var needSpinner = true;
+    var inTick = false;
 
-    process._tickCallback = function() {
-      var nextTickLength = nextTickQueue.length;
-      if (nextTickLength === 0) return;
+    // this infobox thing is used so that the C++ code in src/node.cc
+    // can have easy accesss to our nextTick state, and avoid unnecessary
+    // calls into process._tickCallback.
+    // order is [length, index]
+    // Never write code like this without very good reason!
+    var infoBox = process._tickInfoBox;
+    var length = 0;
+    var index = 1;
 
-      while (nextTickIndex < nextTickLength) {
-        var tock = nextTickQueue[nextTickIndex++];
-        var callback = tock.callback;
+    process.nextTick = nextTick;
+    // needs to be accessible from cc land
+    process._nextDomainTick = _nextDomainTick;
+    process._tickCallback = _tickCallback;
+    process._tickDomainCallback = _tickDomainCallback;
+
+    function Tock(cb, domain) {
+      this.callback = cb;
+      this.domain = domain;
+    }
+
+    function tickDone() {
+      if (infoBox[length] !== 0) {
+        if (infoBox[length] <= infoBox[index]) {
+          nextTickQueue = [];
+          infoBox[length] = 0;
+        } else {
+          nextTickQueue.splice(0, infoBox[index]);
+          infoBox[length] = nextTickQueue.length;
+        }
+      }
+      inTick = false;
+      infoBox[index] = 0;
+    }
+
+    // run callbacks that have no domain
+    // using domains will cause this to be overridden
+    function _tickCallback() {
+      var callback, nextTickLength, threw;
+
+      if (inTick) return;
+      if (infoBox[length] === 0) {
+        infoBox[index] = 0;
+        return;
+      }
+      inTick = true;
+
+      while (infoBox[index] < infoBox[length]) {
+        callback = nextTickQueue[infoBox[index]++].callback;
+        threw = true;
+        try {
+          callback();
+          threw = false;
+        } finally {
+          if (threw) tickDone();
+        }
+      }
+
+      tickDone();
+    }
+
+    function _tickDomainCallback() {
+      var nextTickLength, tock, callback;
+
+      if (lastThrew) {
+        lastThrew = false;
+        return;
+      }
+
+      if (inTick) return;
+      if (infoBox[length] === 0) {
+        infoBox[index] = 0;
+        return;
+      }
+      inTick = true;
+
+      while (infoBox[index] < infoBox[length]) {
+        tock = nextTickQueue[infoBox[index]++];
+        callback = tock.callback;
         if (tock.domain) {
           if (tock.domain._disposed) continue;
           tock.domain.enter();
         }
-        callback();
-        if (tock.domain) {
-          tock.domain.exit();
+        lastThrew = true;
+        try {
+          callback();
+          lastThrew = false;
+        } finally {
+          if (lastThrew) tickDone();
         }
+        if (tock.domain)
+          tock.domain.exit();
       }
 
-      nextTickQueue.splice(0, nextTickIndex);
-      nextTickIndex = 0;
-    };
+      tickDone();
+    }
 
-    process.nextTick = function(callback) {
-      var tock = { callback: callback };
-      if (process.domain) tock.domain = process.domain;
-      nextTickQueue.push(tock);
-      process._needTickCallback();
-    };
+    function nextTick(callback) {
+      // on the way out, don't bother. it won't get fired anyway.
+      if (process._exiting)
+        return;
+
+      nextTickQueue.push(new Tock(callback, null));
+      infoBox[length]++;
+    }
+
+    function _nextDomainTick(callback) {
+      // on the way out, don't bother. it won't get fired anyway.
+      if (process._exiting)
+        return;
+
+      nextTickQueue.push(new Tock(callback, process.domain));
+      infoBox[length]++;
+    }
   };
 
   function evalScript(name) {
@@ -267,7 +443,19 @@
     var module = new Module(name);
     module.filename = path.join(cwd, name);
     module.paths = Module._nodeModulePaths(cwd);
-    var result = module._compile('return eval(process._eval)', name);
+    var script = process._eval;
+    if (!Module._contextLoad) {
+      var body = script;
+      script = 'global.__filename = ' + JSON.stringify(name) + ';\n' +
+               'global.exports = exports;\n' +
+               'global.module = module;\n' +
+               'global.__dirname = __dirname;\n' +
+               'global.require = require;\n' +
+               'return require("vm").runInThisContext(' +
+               JSON.stringify(body) + ', ' +
+               JSON.stringify(name) + ', 0, true);\n';
+    }
+    var result = module._compile(script, name + '-wrapper');
     if (process._print_eval) console.log(result);
   }
 
@@ -307,14 +495,20 @@
         break;
 
       case 'PIPE':
+      case 'TCP':
         var net = NativeModule.require('net');
-        stream = new net.Stream(fd);
+        stream = new net.Socket({
+          fd: fd,
+          readable: false,
+          writable: true
+        });
 
-        // FIXME Should probably have an option in net.Stream to create a
+        // FIXME Should probably have an option in net.Socket to create a
         // stream from an existing fd which is writable only. But for now
         // we'll just add this hack and set the `readable` member to false.
         // Test: ./node test/fixtures/echo.js < /etc/passwd
         stream.readable = false;
+        stream.read = null;
         stream._type = 'pipe';
 
         // FIXME Hack to have stream not keep the event loop alive.
@@ -374,18 +568,26 @@
       switch (tty_wrap.guessHandleType(fd)) {
         case 'TTY':
           var tty = NativeModule.require('tty');
-          stdin = new tty.ReadStream(fd);
+          stdin = new tty.ReadStream(fd, {
+            highWaterMark: 0,
+            readable: true,
+            writable: false
+          });
           break;
 
         case 'FILE':
           var fs = NativeModule.require('fs');
-          stdin = new fs.ReadStream(null, {fd: fd});
+          stdin = new fs.ReadStream(null, { fd: fd });
           break;
 
         case 'PIPE':
+        case 'TCP':
           var net = NativeModule.require('net');
-          stdin = new net.Stream(fd);
-          stdin.readable = true;
+          stdin = new net.Socket({
+            fd: fd,
+            readable: true,
+            writable: false
+          });
           break;
 
         default:
@@ -397,16 +599,23 @@
       stdin.fd = fd;
 
       // stdin starts out life in a paused state, but node doesn't
-      // know yet.  Call pause() explicitly to unref() it.
-      stdin.pause();
+      // know yet.  Explicitly to readStop() it to put it in the
+      // not-reading state.
+      if (stdin._handle && stdin._handle.readStop) {
+        stdin._handle.reading = false;
+        stdin._readableState.reading = false;
+        stdin._handle.readStop();
+      }
 
-      // when piping stdin to a destination stream,
-      // let the data begin to flow.
-      var pipe = stdin.pipe;
-      stdin.pipe = function(dest, opts) {
-        stdin.resume();
-        return pipe.call(stdin, dest, opts);
-      };
+      // if the user calls stdin.pause(), then we need to stop reading
+      // immediately, so that the process can close down.
+      stdin.on('pause', function() {
+        if (!stdin._handle)
+          return;
+        stdin._readableState.reading = false;
+        stdin._handle.reading = false;
+        stdin._handle.readStop();
+      });
 
       return stdin;
     });
@@ -442,7 +651,7 @@
       }
 
       if (r) {
-        throw errnoException(errno, 'kill');
+        throw errnoException(process._errno, 'kill');
       }
 
       return true;
@@ -452,40 +661,47 @@
   startup.processSignalHandlers = function() {
     // Load events module in order to access prototype elements on process like
     // process.addListener.
-    var signalWatchers = {};
+    var signalWraps = {};
     var addListener = process.addListener;
     var removeListener = process.removeListener;
 
     function isSignal(event) {
-      return event.slice(0, 3) === 'SIG' && startup.lazyConstants()[event];
+      return event.slice(0, 3) === 'SIG' &&
+             startup.lazyConstants().hasOwnProperty(event);
     }
 
     // Wrap addListener for the special signal types
     process.on = process.addListener = function(type, listener) {
-      var ret = addListener.apply(this, arguments);
-      if (isSignal(type)) {
-        if (!signalWatchers.hasOwnProperty(type)) {
-          var b = process.binding('signal_watcher');
-          var w = new b.SignalWatcher(startup.lazyConstants()[type]);
-          w.callback = function() { process.emit(type); };
-          signalWatchers[type] = w;
-          w.start();
+      if (isSignal(type) &&
+          !signalWraps.hasOwnProperty(type)) {
+        var Signal = process.binding('signal_wrap').Signal;
+        var wrap = new Signal();
 
-        } else if (this.listeners(type).length === 1) {
-          signalWatchers[type].start();
+        wrap.unref();
+
+        wrap.onsignal = function() { process.emit(type); };
+
+        var signum = startup.lazyConstants()[type];
+        var r = wrap.start(signum);
+        if (r) {
+          wrap.close();
+          throw errnoException(process._errno, 'uv_signal_start');
         }
+
+        signalWraps[type] = wrap;
       }
 
-      return ret;
+      return addListener.apply(this, arguments);
     };
 
     process.removeListener = function(type, listener) {
       var ret = removeListener.apply(this, arguments);
       if (isSignal(type)) {
-        assert(signalWatchers.hasOwnProperty(type));
+        assert(signalWraps.hasOwnProperty(type));
 
         if (this.listeners(type).length === 0) {
-          signalWatchers[type].stop();
+          signalWraps[type].close();
+          delete signalWraps[type];
         }
       }
 
@@ -567,8 +783,8 @@
 
     var nativeModule = new NativeModule(id);
 
-    nativeModule.compile();
     nativeModule.cache();
+    nativeModule.compile();
 
     return nativeModule.exports;
   };
@@ -598,7 +814,7 @@
     var source = NativeModule.getSource(this.id);
     source = NativeModule.wrap(source);
 
-    var fn = runInThisContext(source, this.filename, true);
+    var fn = runInThisContext(source, this.filename, 0, true);
     fn(this.exports, NativeModule.require, this, this.filename);
 
     this.loaded = true;

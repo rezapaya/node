@@ -30,18 +30,12 @@
 
 #include "ia32/assembler-ia32.h"
 #include "ia32/assembler-ia32-inl.h"
+#include "macro-assembler.h"
 
 namespace v8 {
 namespace internal {
 
-#ifdef V8_INTERPRETED_REGEXP
-class RegExpMacroAssemblerIA32: public RegExpMacroAssembler {
- public:
-  RegExpMacroAssemblerIA32() { }
-  virtual ~RegExpMacroAssemblerIA32() { }
-};
-
-#else  // V8_INTERPRETED_REGEXP
+#ifndef V8_INTERPRETED_REGEXP
 class RegExpMacroAssemblerIA32: public NativeRegExpMacroAssembler {
  public:
   RegExpMacroAssemblerIA32(Mode mode, int registers_to_save, Zone* zone);
@@ -58,10 +52,6 @@ class RegExpMacroAssemblerIA32: public NativeRegExpMacroAssembler {
                                       Label* on_equal);
   virtual void CheckCharacterGT(uc16 limit, Label* on_greater);
   virtual void CheckCharacterLT(uc16 limit, Label* on_less);
-  virtual void CheckCharacters(Vector<const uc16> str,
-                               int cp_offset,
-                               Label* on_failure,
-                               bool check_end_of_string);
   // A "greedy loop" is a loop that is both greedy and with a simple
   // body. It has a particularly simple implementation.
   virtual void CheckGreedyLoop(Label* on_tos_equals_current_position);
@@ -202,6 +192,8 @@ class RegExpMacroAssemblerIA32: public NativeRegExpMacroAssembler {
   // Pops a value from the backtrack stack. Reads the word at the stack pointer
   // (ecx) and increments it by a word size.
   inline void Pop(Register target);
+
+  Isolate* isolate() const { return masm_->isolate(); }
 
   MacroAssembler* masm_;
 
