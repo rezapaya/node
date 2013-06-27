@@ -48,11 +48,15 @@
 #error both DEBUG and NDEBUG are set
 #endif
 
+// TODO(dcarney): remove this
+#define V8_ALLOW_ACCESS_TO_RAW_HANDLE_CONSTRUCTOR
+
 // Basic includes
 #include "../include/v8.h"
 #include "v8globals.h"
 #include "v8checks.h"
 #include "allocation.h"
+#include "assert-scope.h"
 #include "v8utils.h"
 #include "flags.h"
 
@@ -65,6 +69,7 @@
 #include "log-inl.h"
 #include "cpu-profiler-inl.h"
 #include "handles-inl.h"
+#include "heap-snapshot-generator-inl.h"
 #include "zone-inl.h"
 
 namespace v8 {
@@ -116,6 +121,15 @@ class V8 : public AllStatic {
   static void RemoveCallCompletedCallback(CallCompletedCallback callback);
   static void FireCallCompletedCallback(Isolate* isolate);
 
+  static v8::ArrayBuffer::Allocator* ArrayBufferAllocator() {
+    return array_buffer_allocator_;
+  }
+
+  static void SetArrayBufferAllocator(v8::ArrayBuffer::Allocator *allocator) {
+    CHECK_EQ(NULL, array_buffer_allocator_);
+    array_buffer_allocator_ = allocator;
+  }
+
  private:
   static void InitializeOncePerProcessImpl();
   static void InitializeOncePerProcess();
@@ -134,15 +148,13 @@ class V8 : public AllStatic {
   static bool use_crankshaft_;
   // List of callbacks when a Call completes.
   static List<CallCompletedCallback>* call_completed_callbacks_;
+  // Allocator for external array buffers.
+  static v8::ArrayBuffer::Allocator* array_buffer_allocator_;
 };
 
 
 // JavaScript defines two kinds of 'nil'.
 enum NilValue { kNullValue, kUndefinedValue };
-
-
-// JavaScript defines two kinds of equality.
-enum EqualityKind { kStrictEquality, kNonStrictEquality };
 
 
 } }  // namespace v8::internal

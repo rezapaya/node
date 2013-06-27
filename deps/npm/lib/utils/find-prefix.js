@@ -14,7 +14,6 @@ function findPrefix (p, cb_) {
   }
 
   p = path.resolve(p)
-  if (npm.config.get("global")) return cb(null, p)
   // if there's no node_modules folder, then
   // walk up until we hopefully find one.
   // if none anywhere, then use cwd.
@@ -35,7 +34,12 @@ function findPrefix_ (p, original, cb) {
   }
   fs.readdir(p, function (er, files) {
     // an error right away is a bad sign.
-    if (er && p === original) return cb(er)
+    // unless the prefix was simply a non
+    // existent directory.
+    if (er && p === original) {
+      if (er.code === "ENOENT") return cb(null, original);
+      return cb(er)
+    }
 
     // walked up too high or something.
     if (er) return cb(null, original)

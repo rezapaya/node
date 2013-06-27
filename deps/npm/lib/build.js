@@ -1,4 +1,3 @@
-
 // npm build command
 
 // everything about the installation after the creation of
@@ -17,10 +16,9 @@ var npm = require("./npm.js")
   , readJson = require("read-package-json")
   , link = require("./utils/link.js")
   , linkIfExists = link.ifExists
-  , cmdShim = require("./utils/cmd-shim.js")
+  , cmdShim = require("cmd-shim")
   , cmdShimIfExists = cmdShim.ifExists
   , asyncMap = require("slide").asyncMap
-  , output = require("./utils/output.js")
 
 module.exports = build
 build.usage = "npm build <folder>\n(this is plumbing)"
@@ -63,11 +61,17 @@ function build_ (global, didPre, didRB) { return function (folder, cb) {
 function writeBuiltinConf (folder, cb) {
   // the builtin config is "sticky". Any time npm installs itself,
   // it puts its builtin config file there, as well.
-  var ini = require("./utils/ini.js")
-  ini.saveConfig("builtin", path.resolve(folder, "npmrc"), cb)
+  if (!npm.config.usingBuiltin
+      || folder !== path.dirname(__dirname)) {
+    return cb()
+  }
+  npm.config.save("builtin", cb)
 }
 
 function linkStuff (pkg, folder, global, didRB, cb) {
+  // allow to opt out of linking binaries.
+  if (npm.config.get("bin-links") === false) return cb()
+
   // if it's global, and folder is in {prefix}/node_modules,
   // then bins are in {prefix}/bin
   // otherwise, then bins are in folder/../.bin
@@ -79,16 +83,43 @@ function linkStuff (pkg, folder, global, didRB, cb) {
   log.verbose("linkStuff", [global, gnm, gtop, parent])
   log.info("linkStuff", pkg._id)
 
-  if (top && pkg.preferGlobal && !global) {
-    log.warn("prefer global", pkg._id + " should be installed with -g")
-  }
+  shouldWarn(pkg, folder, global, function() {
+    asyncMap( [linkBins, linkMans, !didRB && rebuildBundles]
+            , function (fn, cb) {
+      if (!fn) return cb()
+      log.verbose(fn.name, pkg._id)
+      fn(pkg, folder, parent, gtop, cb)
+    }, cb)
+  })
+}
 
-  asyncMap( [linkBins, linkMans, !didRB && rebuildBundles]
-          , function (fn, cb) {
-    if (!fn) return cb()
-    log.verbose(fn.name, pkg._id)
-    fn(pkg, folder, parent, gtop, cb)
-  }, cb)
+function shouldWarn(pkg, folder, global, cb) {
+  var parent = path.dirname(folder)
+    , top = parent === npm.dir
+    , cwd = process.cwd()
+
+  readJson(path.resolve(cwd, "package.json"), function(er, topPkg) {
+    if (er) return cb(er)
+
+    var linkedPkg = path.basename(cwd)
+      , currentPkg = path.basename(folder)
+
+    // current searched package is the linked package on first call
+    if (linkedPkg !== currentPkg) {
+
+      if (!topPkg.dependencies) return cb()
+
+      // don't generate a warning if it's listed in dependencies
+      if (Object.keys(topPkg.dependencies).indexOf(currentPkg) === -1) {
+
+        if (top && pkg.preferGlobal && !global) {
+          log.warn("prefer global", pkg._id + " should be installed with -g")
+        }
+      }
+    }
+
+    cb()
+  })
 }
 
 function rebuildBundles (pkg, folder, parent, gtop, cb) {
@@ -108,7 +139,7 @@ function rebuildBundles (pkg, folder, parent, gtop, cb) {
     chain(files.filter(function (file) {
       // rebuild if:
       // not a .folder, like .bin or .hooks
-      return file.charAt(0) !== "."
+      return !file.match(/^[\._-]/)
           // not some old 0.x style bundle
           && file.indexOf("@") === -1
           // either not a dep, or explicitly bundled
@@ -150,7 +181,8 @@ function linkBins (pkg, folder, parent, gtop, cb) {
           , out = npm.config.get("parseable")
                 ? dest + "::" + src + ":BINFILE"
                 : dest + " -> " + src
-        output.write(out, cb)
+        console.log(out)
+        cb()
       })
     })
   }, cb)
@@ -166,6 +198,7 @@ function linkBin (from, to, gently, cb) {
 
 function linkMans (pkg, folder, parent, gtop, cb) {
   if (!pkg.man || !gtop || process.platform === "win32") return cb()
+
   var manRoot = path.resolve(npm.config.get("prefix"), "share", "man")
   asyncMap(pkg.man, function (man, cb) {
     if (typeof man !== "string") return cb()
@@ -174,13 +207,13 @@ function linkMans (pkg, folder, parent, gtop, cb) {
       , sxn = parseMan[2]
       , gz = parseMan[3] || ""
       , bn = path.basename(stem)
-      , manSrc = path.join( folder, man )
       , manDest = path.join( manRoot
                            , "man"+sxn
                            , (bn.indexOf(pkg.name) === 0 ? bn
                              : pkg.name + "-" + bn)
                              + "." + sxn + gz
                            )
-    linkIfExists(manSrc, manDest, gtop && folder, cb)
+
+    linkIfExists(man, manDest, gtop && folder, cb)
   }, cb)
 }

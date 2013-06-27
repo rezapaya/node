@@ -3,13 +3,12 @@ exports = module.exports = lifecycle
 exports.cmd = cmd
 
 var log = require("npmlog")
-  , exec = require("./exec.js")
+  , spawn = require("child_process").spawn
   , npm = require("../npm.js")
   , path = require("path")
   , fs = require("graceful-fs")
   , chain = require("slide").chain
   , constants = require("constants")
-  , output = require("./output.js")
   , Stream = require("stream").Stream
   , PATH = "PATH"
 
@@ -49,6 +48,8 @@ function lifecycle (pkg, stage, wd, unsafe, failOk, cb) {
     // set the env variables, then run scripts as a child process.
     var env = makeEnv(pkg)
     env.npm_lifecycle_event = stage
+    env.npm_node_execpath = env.NODE = env.NODE || process.execPath
+    env.npm_execpath = require.main.filename
 
     // "nobody" typically doesn't have permission to write to /tmp
     // even if it's never used, sh freaks out.
@@ -69,6 +70,12 @@ function lifecycle_ (pkg, stage, wd, env, unsafe, failOk, cb) {
   var pathArr = []
     , p = wd.split("node_modules")
     , acc = path.resolve(p.shift())
+
+  // first add the directory containing the `node` executable currently
+  // running, so that any lifecycle script that invoke "node" will execute
+  // this same one.
+  pathArr.unshift(path.dirname(process.execPath))
+
   p.forEach(function (pp) {
     pathArr.unshift(path.join(acc, "node_modules", ".bin"))
     acc = path.join(acc, "node_modules", pp)
@@ -87,14 +94,6 @@ function lifecycle_ (pkg, stage, wd, env, unsafe, failOk, cb) {
   if (packageLifecycle) {
     // define this here so it's available to all scripts.
     env.npm_lifecycle_script = pkg.scripts[stage]
-    // if the command is "node-gyp <args>", then call ours instead.
-    try {
-      var ourGyp = require.resolve("node-gyp/bin/node-gyp.js")
-    } catch (er) {
-      return cb(new Error("No gyp installed with npm"))
-    }
-    var gyp = path.execPath + " " + JSON.stringify(ourGyp)
-    pkg.scripts[stage] = pkg.scripts[stage].replace(/^node-gyp( |$)/, gyp)
   }
 
   if (failOk) {
@@ -149,32 +148,30 @@ function runPackageLifecycle (pkg, env, wd, unsafe, cb) {
   var note = "\n> " + pkg._id + " " + stage + " " + wd
            + "\n> " + cmd + "\n"
 
-  output.write(note, function (er) {
-    if (er) return cb(er)
+  console.log(note)
 
-    exec( sh, [shFlag, cmd], env, true, wd
-        , user, group
-        , function (er, code, stdout, stderr) {
-      if (er && !npm.ROLLBACK) {
-        log.info(pkg._id, "Failed to exec "+stage+" script")
-        er.message = pkg._id + " "
-                   + stage + ": `" + env.npm_lifecycle_script+"`\n"
-                   + er.message
-        if (er.code !== "EPERM") {
-          er.code = "ELIFECYCLE"
-        }
-        er.pkgid = pkg._id
-        er.stage = stage
-        er.script = env.npm_lifecycle_script
-        er.pkgname = pkg.name
-        return cb(er)
-      } else if (er) {
-        log.error(pkg._id+"."+stage, er)
-        log.error(pkg._id+"."+stage, "continuing anyway")
-        return cb()
+  var conf = { cwd: wd, env: env, customFds: [ 0, 1, 2] }
+  var proc = spawn(sh, [shFlag, cmd], conf)
+  proc.on("close", function (er, stdout, stderr) {
+    if (er && !npm.ROLLBACK) {
+      log.info(pkg._id, "Failed to exec "+stage+" script")
+      er.message = pkg._id + " "
+                 + stage + ": `" + env.npm_lifecycle_script+"`\n"
+                 + er.message
+      if (er.code !== "EPERM") {
+        er.code = "ELIFECYCLE"
       }
-      cb(er)
-    })
+      er.pkgid = pkg._id
+      er.stage = stage
+      er.script = env.npm_lifecycle_script
+      er.pkgname = pkg.name
+      return cb(er)
+    } else if (er) {
+      log.error(pkg._id+"."+stage, er)
+      log.error(pkg._id+"."+stage, "continuing anyway")
+      return cb()
+    }
+    cb(er)
   })
 }
 
@@ -189,9 +186,9 @@ function runHookLifecycle (pkg, env, wd, unsafe, cb) {
   fs.stat(hook, function (er) {
     if (er) return cb()
 
-    exec( "sh", ["-c", cmd], env, true, wd
-        , user, group
-        , function (er) {
+    var conf = { cwd: wd, env: env, customFds: [ 0, 1, 2] }
+    var proc = spawn("sh", ["-c", cmd], conf)
+    proc.on("close", function (er) {
       if (er) {
         er.message += "\nFailed to exec "+stage+" hook script"
         log.info(pkg._id, er)
@@ -225,6 +222,9 @@ function makeEnv (data, prefix, env) {
 
   for (var i in data) if (i.charAt(0) !== "_") {
     var envKey = (prefix+i).replace(/[^a-zA-Z0-9_]/g, '_')
+    if (i === "readme") {
+      continue
+    }
     if (data[i] && typeof(data[i]) === "object") {
       try {
         // quick and dirty detection for cyclical structures
@@ -250,8 +250,7 @@ function makeEnv (data, prefix, env) {
 
   prefix = "npm_config_"
   var pkgConfig = {}
-    , ini = require("./ini.js")
-    , keys = ini.keys
+    , keys = npm.config.keys
     , pkgVerConfig = {}
     , namePref = data.name + ":"
     , verPref = data.name + "@" + data.version + ":"
@@ -260,8 +259,8 @@ function makeEnv (data, prefix, env) {
     if (i.charAt(0) === "_" && i.indexOf("_"+namePref) !== 0) {
       return
     }
-    var value = ini.get(i)
-    if (value instanceof Stream) return
+    var value = npm.config.get(i)
+    if (value instanceof Stream || Array.isArray(value)) return
     if (!value) value = ""
     else if (typeof value !== "string") value = JSON.stringify(value)
 

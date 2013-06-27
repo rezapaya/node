@@ -2,7 +2,17 @@
 
 BUILDTYPE ?= Release
 PYTHON ?= python
+NINJA ?= ninja
 DESTDIR ?=
+SIGN ?=
+PREFIX ?= /usr/local
+
+NODE ?= ./node
+
+# Default to verbose builds.
+# To do quiet/pretty builds, run `make V=` to set V to an empty string,
+# or set the V environment variable to an empty string.
+V ?= 1
 
 # BUILDTYPE=Debug builds both release and debug builds. If you want to compile
 # just the debug build, run `make -C out BUILDTYPE=Debug` instead.
@@ -16,28 +26,40 @@ endif
 # to check for changes.
 .PHONY: node node_g
 
+ifeq ($(USE_NINJA),1)
 node: config.gypi
-	$(MAKE) -C out BUILDTYPE=Release
+	$(NINJA) -C out/Release/
 	ln -fs out/Release/node node
 
 node_g: config.gypi
-	$(MAKE) -C out BUILDTYPE=Debug
-	ln -fs out/Debug/node node_g
+	$(NINJA) -C out/Debug/
+	ln -fs out/Debug/node $@
+else
+node: config.gypi out/Makefile
+	$(MAKE) -C out BUILDTYPE=Release V=$(V)
+	ln -fs out/Release/node node
 
-config.gypi: configure
-	./configure
-
-out/Debug/node:
-	$(MAKE) -C out BUILDTYPE=Debug
+node_g: config.gypi out/Makefile
+	$(MAKE) -C out BUILDTYPE=Debug V=$(V)
+	ln -fs out/Debug/node $@
+endif
 
 out/Makefile: common.gypi deps/uv/uv.gyp deps/http_parser/http_parser.gyp deps/zlib/zlib.gyp deps/v8/build/common.gypi deps/v8/tools/gyp/v8.gyp node.gyp config.gypi
+ifeq ($(USE_NINJA),1)
+	touch out/Makefile
+	$(PYTHON) tools/gyp_node -f ninja
+else
 	$(PYTHON) tools/gyp_node -f make
+endif
+
+config.gypi: configure
+	$(PYTHON) ./configure
 
 install: all
-	out/Release/node tools/installer.js install $(DESTDIR)
+	$(PYTHON) tools/install.py $@ '$(DESTDIR)' '$(PREFIX)'
 
 uninstall:
-	out/Release/node tools/installer.js uninstall
+	$(PYTHON) tools/install.py $@ '$(DESTDIR)' '$(PREFIX)'
 
 clean:
 	-rm -rf out/Makefile node node_g out/$(BUILDTYPE)/node blog.html email.md
@@ -53,7 +75,7 @@ distclean:
 
 test: all
 	$(PYTHON) tools/test.py --mode=release simple message
-	PYTHONPATH=tools/closure_linter/ $(PYTHON) tools/closure_linter/closure_linter/gjslint.py --unix_mode --strict --nojsdoc -r lib/ -r src/ --exclude_files lib/punycode.js
+	$(MAKE) jslint
 
 test-http1: all
 	$(PYTHON) tools/test.py --mode=release --use-http1 simple message
@@ -108,7 +130,7 @@ apidoc_sources = $(wildcard doc/api/*.markdown)
 apidocs = $(addprefix out/,$(apidoc_sources:.markdown=.html)) \
           $(addprefix out/,$(apidoc_sources:.markdown=.json))
 
-apidoc_dirs = out/doc out/doc/api/ out/doc/api/assets out/doc/about out/doc/community out/doc/logos out/doc/images
+apidoc_dirs = out/doc out/doc/api/ out/doc/api/assets out/doc/about out/doc/community out/doc/download out/doc/logos out/doc/images
 
 apiassets = $(subst api_assets,api/assets,$(addprefix out/,$(wildcard doc/api_assets/*)))
 
@@ -126,11 +148,12 @@ website_files = \
 	out/doc/pipe.css \
 	out/doc/about/index.html \
 	out/doc/community/index.html \
+	out/doc/download/index.html \
 	out/doc/logos/index.html \
 	out/doc/changelog.html \
 	$(doc_images)
 
-doc: program $(apidoc_dirs) $(website_files) $(apiassets) $(apidocs) tools/doc/ blog
+doc: $(apidoc_dirs) $(website_files) $(apiassets) $(apidocs) tools/doc/ blog node
 
 blogclean:
 	rm -rf out/blog
@@ -144,19 +167,19 @@ $(apidoc_dirs):
 out/doc/api/assets/%: doc/api_assets/% out/doc/api/assets/
 	cp $< $@
 
-out/doc/changelog.html: ChangeLog doc/changelog-head.html doc/changelog-foot.html tools/build-changelog.sh
+out/doc/changelog.html: ChangeLog doc/changelog-head.html doc/changelog-foot.html tools/build-changelog.sh node
 	bash tools/build-changelog.sh
 
-out/doc/%.html: doc/%.html
+out/doc/%.html: doc/%.html node
 	cat $< | sed -e 's|__VERSION__|'$(VERSION)'|g' > $@
 
 out/doc/%: doc/%
 	cp -r $< $@
 
-out/doc/api/%.json: doc/api/%.markdown
+out/doc/api/%.json: doc/api/%.markdown node
 	out/Release/node tools/doc/generate.js --format=json $< > $@
 
-out/doc/api/%.html: doc/api/%.markdown
+out/doc/api/%.html: doc/api/%.markdown node
 	out/Release/node tools/doc/generate.js --format=html --template=doc/template.html $< > $@
 
 email.md: ChangeLog tools/email-footer.md
@@ -185,38 +208,45 @@ docopen: out/doc/api/all.html
 docclean:
 	-rm -rf out/doc
 
-VERSION=v$(shell $(PYTHON) tools/getnodeversion.py)
+RAWVER=$(shell $(PYTHON) tools/getnodeversion.py)
+VERSION=v$(RAWVER)
+RELEASE=$(shell $(PYTHON) tools/getnodeisrelease.py)
+PLATFORM=$(shell uname | tr '[:upper:]' '[:lower:]')
+ifeq ($(findstring x86_64,$(shell uname -m)),x86_64)
+DESTCPU ?= x64
+else
+DESTCPU ?= ia32
+endif
+ifeq ($(DESTCPU),x64)
+ARCH=x64
+else
+ifeq ($(DESTCPU),arm)
+ARCH=arm
+else
+ARCH=x86
+endif
+endif
 TARNAME=node-$(VERSION)
+ifdef NIGHTLY
+TAG = nightly-$(NIGHTLY)
+TARNAME=node-$(VERSION)-$(TAG)
+endif
 TARBALL=$(TARNAME).tar.gz
+BINARYNAME=$(TARNAME)-$(PLATFORM)-$(ARCH)
+BINARYTAR=$(BINARYNAME).tar.gz
 PKG=out/$(TARNAME).pkg
 packagemaker=/Developer/Applications/Utilities/PackageMaker.app/Contents/MacOS/PackageMaker
+
+PKGSRC=nodejs-$(DESTCPU)-$(RAWVER).tgz
+ifdef NIGHTLY
+PKGSRC=nodejs-$(DESTCPU)-$(RAWVER)-$(TAG).tgz
+endif
 
 dist: doc $(TARBALL) $(PKG)
 
 PKGDIR=out/dist-osx
 
-pkg: $(PKG)
-
-$(PKG):
-	rm -rf $(PKGDIR)
-	rm -rf out/deps out/Release
-	./configure --prefix=$(PKGDIR)/32/usr/local --without-snapshot --dest-cpu=ia32
-	$(MAKE) install
-	rm -rf out/deps out/Release
-	./configure --prefix=$(PKGDIR)/usr/local --without-snapshot --dest-cpu=x64
-	$(MAKE) install
-	lipo $(PKGDIR)/32/usr/local/bin/node \
-		$(PKGDIR)/usr/local/bin/node \
-		-output $(PKGDIR)/usr/local/bin/node-universal \
-		-create
-	mv $(PKGDIR)/usr/local/bin/node-universal $(PKGDIR)/usr/local/bin/node
-	rm -rf $(PKGDIR)/32
-	$(packagemaker) \
-		--id "org.nodejs.NodeJS-$(VERSION)" \
-		--doc tools/osx-pkg.pmdoc \
-		--out $(PKG)
-
-$(TARBALL): node out/doc
+release-only:
 	@if [ "$(shell git status --porcelain | egrep -v '^\?\? ')" = "" ]; then \
 		exit 0 ; \
 	else \
@@ -228,15 +258,40 @@ $(TARBALL): node out/doc
 		echo "" >&2 ; \
 		exit 1 ; \
 	fi
-	@if [ $(shell ./node --version) = "$(VERSION)" ]; then \
+	@if [ "$(NIGHTLY)" != "" -o "$(RELEASE)" = "1" ]; then \
 		exit 0; \
 	else \
 	  echo "" >&2 ; \
-		echo "$(shell ./node --version) doesn't match $(VERSION)." >&2 ; \
+		echo "#NODE_VERSION_IS_RELEASE is set to $(RELEASE)." >&2 ; \
 	  echo "Did you remember to update src/node_version.cc?" >&2 ; \
 	  echo "" >&2 ; \
 		exit 1 ; \
 	fi
+
+pkg: $(PKG)
+
+$(PKG): release-only
+	rm -rf $(PKGDIR)
+	rm -rf out/deps out/Release
+	$(PYTHON) ./configure --without-snapshot --dest-cpu=ia32 --tag=$(TAG)
+	$(MAKE) install V=$(V) DESTDIR=$(PKGDIR)/32
+	rm -rf out/deps out/Release
+	$(PYTHON) ./configure --without-snapshot --dest-cpu=x64 --tag=$(TAG)
+	$(MAKE) install V=$(V) DESTDIR=$(PKGDIR)
+	SIGN="$(SIGN)" PKGDIR="$(PKGDIR)" bash tools/osx-codesign.sh
+	lipo $(PKGDIR)/32/usr/local/bin/node \
+		$(PKGDIR)/usr/local/bin/node \
+		-output $(PKGDIR)/usr/local/bin/node-universal \
+		-create
+	mv $(PKGDIR)/usr/local/bin/node-universal $(PKGDIR)/usr/local/bin/node
+	rm -rf $(PKGDIR)/32
+	$(packagemaker) \
+		--id "org.nodejs.Node" \
+		--doc tools/osx-pkg.pmdoc \
+		--out $(PKG)
+	SIGN="$(SIGN)" PKG="$(PKG)" bash tools/osx-productsign.sh
+
+$(TARBALL): release-only node doc
 	git archive --format=tar --prefix=$(TARNAME)/ HEAD | tar xf -
 	mkdir -p $(TARNAME)/doc/api
 	cp doc/node.1 $(TARNAME)/doc/node.1
@@ -248,18 +303,87 @@ $(TARBALL): node out/doc
 	rm -rf $(TARNAME)
 	gzip -f -9 $(TARNAME).tar
 
+tar: $(TARBALL)
+
+$(BINARYTAR): release-only
+	rm -rf $(BINARYNAME)
+	rm -rf out/deps out/Release
+	$(PYTHON) ./configure --prefix=/ --without-snapshot --dest-cpu=$(DESTCPU) --tag=$(TAG) $(CONFIG_FLAGS)
+	$(MAKE) install DESTDIR=$(BINARYNAME) V=$(V) PORTABLE=1
+	cp README.md $(BINARYNAME)
+	cp LICENSE $(BINARYNAME)
+	cp ChangeLog $(BINARYNAME)
+	tar -cf $(BINARYNAME).tar $(BINARYNAME)
+	rm -rf $(BINARYNAME)
+	gzip -f -9 $(BINARYNAME).tar
+
+binary: $(BINARYTAR)
+
+$(PKGSRC): release-only
+	rm -rf dist out
+	$(PYTHON) configure --prefix=/ --without-snapshot \
+		--dest-cpu=$(DESTCPU) --tag=$(TAG) $(CONFIG_FLAGS)
+	$(MAKE) install DESTDIR=dist
+	(cd dist; find * -type f | sort) > packlist
+	pkg_info -X pkg_install | \
+		egrep '^(MACHINE_ARCH|OPSYS|OS_VERSION|PKGTOOLS_VERSION)' > build-info
+	pkg_create -B build-info -c tools/pkgsrc/comment -d tools/pkgsrc/description \
+		-f packlist -I /opt/local -p dist -U $(PKGSRC)
+
+pkgsrc: $(PKGSRC)
+
 dist-upload: $(TARBALL) $(PKG)
 	ssh node@nodejs.org mkdir -p web/nodejs.org/dist/$(VERSION)
 	scp $(TARBALL) node@nodejs.org:~/web/nodejs.org/dist/$(VERSION)/$(TARBALL)
 	scp $(PKG) node@nodejs.org:~/web/nodejs.org/dist/$(VERSION)/$(TARNAME).pkg
 
-bench:
+wrkclean:
+	$(MAKE) -C tools/wrk/ clean
+	rm tools/wrk/wrk
+
+wrk: tools/wrk/wrk
+tools/wrk/wrk:
+	$(MAKE) -C tools/wrk/
+
+bench-net: all
+	@$(NODE) benchmark/common.js net
+
+bench-crypto: all
+	@$(NODE) benchmark/common.js crypto
+
+bench-tls: all
+	@$(NODE) benchmark/common.js tls
+
+bench-http: wrk all
+	@$(NODE) benchmark/common.js http
+
+bench-fs: all
+	@$(NODE) benchmark/common.js fs
+
+bench-misc: all
+	@$(MAKE) -C benchmark/misc/function_call/
+	@$(NODE) benchmark/common.js misc
+
+bench-array: all
+	@$(NODE) benchmark/common.js arrays
+
+bench-buffer: all
+	@$(NODE) benchmark/common.js buffers
+
+bench-all: bench bench-misc bench-array bench-buffer
+
+bench: bench-net bench-http bench-fs bench-tls
+
+bench-http-simple:
 	 benchmark/http_simple_bench.sh
 
 bench-idle:
 	./node benchmark/idle_server.js &
 	sleep 1
 	./node benchmark/idle_clients.js &
+
+jslintfix:
+	PYTHONPATH=tools/closure_linter/ $(PYTHON) tools/closure_linter/closure_linter/fixjsstyle.py --strict --nojsdoc -r lib/ -r src/ --exclude_files lib/punycode.js
 
 jslint:
 	PYTHONPATH=tools/closure_linter/ $(PYTHON) tools/closure_linter/closure_linter/gjslint.py --unix_mode --strict --nojsdoc -r lib/ -r src/ --exclude_files lib/punycode.js
@@ -269,4 +393,4 @@ cpplint:
 
 lint: jslint cpplint
 
-.PHONY: lint cpplint jslint bench clean docopen docclean doc dist distclean check uninstall install install-includes install-bin all program staticlib dynamiclib test test-all website-upload pkg blog blogclean
+.PHONY: lint cpplint jslint bench clean docopen docclean doc dist distclean check uninstall install install-includes install-bin all staticlib dynamiclib test test-all website-upload pkg blog blogclean tar binary release-only bench-http-simple bench-idle bench-all bench bench-misc bench-array bench-buffer bench-net bench-http bench-fs bench-tls

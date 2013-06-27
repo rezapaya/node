@@ -34,13 +34,8 @@ class StatWatcher : ObjectWrap {
  protected:
   static v8::Persistent<v8::FunctionTemplate> constructor_template;
 
-  StatWatcher() : ObjectWrap() {
-    uv_fs_poll_init(uv_default_loop(), &watcher_);
-  }
-
-  ~StatWatcher() {
-    Stop();
-  }
+  StatWatcher();
+  virtual ~StatWatcher();
 
   static v8::Handle<v8::Value> New(const v8::Arguments& args);
   static v8::Handle<v8::Value> Start(const v8::Arguments& args);
@@ -49,11 +44,11 @@ class StatWatcher : ObjectWrap {
  private:
   static void Callback(uv_fs_poll_t* handle,
                        int status,
-                       const uv_statbuf_t* prev,
-                       const uv_statbuf_t* curr);
+                       const uv_stat_t* prev,
+                       const uv_stat_t* curr);
   void Stop();
 
-  uv_fs_poll_t watcher_;
+  uv_fs_poll_t* watcher_;
 };
 
 }  // namespace node

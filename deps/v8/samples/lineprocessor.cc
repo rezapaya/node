@@ -25,19 +25,11 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-
-// This controls whether this sample is compiled with debugger support.
-// You may trace its usages in source text to see what parts of program
-// are responsible for debugging support.
-// Note that V8 itself should be compiled with enabled debugger support
-// to have it all working.
-#define SUPPORT_DEBUGGING
-
 #include <v8.h>
 
-#ifdef SUPPORT_DEBUGGING
+#ifdef ENABLE_DEBUGGER_SUPPORT
 #include <v8-debug.h>
-#endif
+#endif  // ENABLE_DEBUGGER_SUPPORT
 
 #include <fcntl.h>
 #include <string.h>
@@ -106,17 +98,18 @@ enum MainCycleType {
 };
 
 const char* ToCString(const v8::String::Utf8Value& value);
-void ReportException(v8::TryCatch* handler);
+void ReportException(v8::Isolate* isolate, v8::TryCatch* handler);
 v8::Handle<v8::String> ReadFile(const char* name);
 v8::Handle<v8::String> ReadLine();
 
-v8::Handle<v8::Value> Print(const v8::Arguments& args);
-v8::Handle<v8::Value> ReadLine(const v8::Arguments& args);
-bool RunCppCycle(v8::Handle<v8::Script> script, v8::Local<v8::Context> context,
+void Print(const v8::FunctionCallbackInfo<v8::Value>& args);
+void ReadLine(const v8::FunctionCallbackInfo<v8::Value>& args);
+bool RunCppCycle(v8::Handle<v8::Script> script,
+                 v8::Local<v8::Context> context,
                  bool report_exceptions);
 
 
-#ifdef SUPPORT_DEBUGGING
+#ifdef ENABLE_DEBUGGER_SUPPORT
 v8::Persistent<v8::Context> debug_message_context;
 
 void DispatchDebugMessages() {
@@ -131,26 +124,31 @@ void DispatchDebugMessages() {
   // "evaluate" command, because it must be executed some context.
   // In our sample we have only one context, so there is nothing really to
   // think about.
-  v8::Context::Scope scope(debug_message_context);
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context =
+      v8::Local<v8::Context>::New(isolate, debug_message_context);
+  v8::Context::Scope scope(context);
 
   v8::Debug::ProcessDebugMessages();
 }
-#endif
+#endif  // ENABLE_DEBUGGER_SUPPORT
 
 
 int RunMain(int argc, char* argv[]) {
   v8::V8::SetFlagsFromCommandLine(&argc, argv, true);
-  v8::HandleScope handle_scope;
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  v8::HandleScope handle_scope(isolate);
 
-  v8::Handle<v8::String> script_source(NULL);
-  v8::Handle<v8::Value> script_name(NULL);
+  v8::Handle<v8::String> script_source;
+  v8::Handle<v8::Value> script_name;
   int script_param_counter = 0;
 
-#ifdef SUPPORT_DEBUGGING
+#ifdef ENABLE_DEBUGGER_SUPPORT
   int port_number = -1;
   bool wait_for_connection = false;
   bool support_callback = false;
-#endif
+#endif  // ENABLE_DEBUGGER_SUPPORT
 
   MainCycleType cycle_type = CycleInCpp;
 
@@ -164,7 +162,7 @@ int RunMain(int argc, char* argv[]) {
       cycle_type = CycleInCpp;
     } else if (strcmp(str, "--main-cycle-in-js") == 0) {
       cycle_type = CycleInJs;
-#ifdef SUPPORT_DEBUGGING
+#ifdef ENABLE_DEBUGGER_SUPPORT
     } else if (strcmp(str, "--callback") == 0) {
       support_callback = true;
     } else if (strcmp(str, "--wait-for-connection") == 0) {
@@ -172,7 +170,7 @@ int RunMain(int argc, char* argv[]) {
     } else if (strcmp(str, "-p") == 0 && i + 1 < argc) {
       port_number = atoi(argv[i + 1]);  // NOLINT
       i++;
-#endif
+#endif  // ENABLE_DEBUGGER_SUPPORT
     } else if (strncmp(str, "--", 2) == 0) {
       printf("Warning: unknown flag %s.\nTry --help for options\n", str);
     } else if (strcmp(str, "-e") == 0 && i + 1 < argc) {
@@ -215,14 +213,14 @@ int RunMain(int argc, char* argv[]) {
 
   // Create a new execution environment containing the built-in
   // functions
-  v8::Handle<v8::Context> context = v8::Context::New(NULL, global);
+  v8::Handle<v8::Context> context = v8::Context::New(isolate, NULL, global);
   // Enter the newly created execution environment.
   v8::Context::Scope context_scope(context);
 
-#ifdef SUPPORT_DEBUGGING
-  debug_message_context = v8::Persistent<v8::Context>::New(context);
+#ifdef ENABLE_DEBUGGER_SUPPORT
+  debug_message_context.Reset(isolate, context);
 
-  v8::Locker locker;
+  v8::Locker locker(isolate);
 
   if (support_callback) {
     v8::Debug::SetDebugMessageDispatchHandler(DispatchDebugMessages, true);
@@ -231,7 +229,7 @@ int RunMain(int argc, char* argv[]) {
   if (port_number != -1) {
     v8::Debug::EnableAgent("lineprocessor", port_number, wait_for_connection);
   }
-#endif
+#endif  // ENABLE_DEBUGGER_SUPPORT
 
   bool report_exceptions = true;
 
@@ -243,7 +241,7 @@ int RunMain(int argc, char* argv[]) {
     if (script.IsEmpty()) {
       // Print errors that happened during compilation.
       if (report_exceptions)
-        ReportException(&try_catch);
+        ReportException(isolate, &try_catch);
       return 1;
     }
   }
@@ -254,13 +252,14 @@ int RunMain(int argc, char* argv[]) {
     script->Run();
     if (try_catch.HasCaught()) {
       if (report_exceptions)
-        ReportException(&try_catch);
+        ReportException(isolate, &try_catch);
       return 1;
     }
   }
 
   if (cycle_type == CycleInCpp) {
-    bool res = RunCppCycle(script, v8::Context::GetCurrent(),
+    bool res = RunCppCycle(script,
+                           v8::Context::GetCurrent(),
                            report_exceptions);
     return !res;
   } else {
@@ -270,15 +269,16 @@ int RunMain(int argc, char* argv[]) {
 }
 
 
-bool RunCppCycle(v8::Handle<v8::Script> script, v8::Local<v8::Context> context,
+bool RunCppCycle(v8::Handle<v8::Script> script,
+                 v8::Local<v8::Context> context,
                  bool report_exceptions) {
-#ifdef SUPPORT_DEBUGGING
-  v8::Locker lock;
-#endif
+  v8::Isolate* isolate = context->GetIsolate();
+#ifdef ENABLE_DEBUGGER_SUPPORT
+  v8::Locker lock(isolate);
+#endif  // ENABLE_DEBUGGER_SUPPORT
 
   v8::Handle<v8::String> fun_name = v8::String::New("ProcessLine");
-  v8::Handle<v8::Value> process_val =
-      v8::Context::GetCurrent()->Global()->Get(fun_name);
+  v8::Handle<v8::Value> process_val = context->Global()->Get(fun_name);
 
   // If there is no Process function, or if it is not a function,
   // bail out
@@ -293,7 +293,7 @@ bool RunCppCycle(v8::Handle<v8::Script> script, v8::Local<v8::Context> context,
 
 
   while (!feof(stdin)) {
-    v8::HandleScope handle_scope;
+    v8::HandleScope handle_scope(isolate);
 
     v8::Handle<v8::String> input_line = ReadLine();
     if (input_line == v8::Undefined()) {
@@ -310,7 +310,7 @@ bool RunCppCycle(v8::Handle<v8::Script> script, v8::Local<v8::Context> context,
                                  argc, argv);
       if (try_catch.HasCaught()) {
         if (report_exceptions)
-          ReportException(&try_catch);
+          ReportException(isolate, &try_catch);
         return false;
       }
     }
@@ -347,7 +347,7 @@ v8::Handle<v8::String> ReadFile(const char* name) {
   char* chars = new char[size + 1];
   chars[size] = '\0';
   for (int i = 0; i < size;) {
-    int read = fread(&chars[i], 1, size - i, file);
+    int read = static_cast<int>(fread(&chars[i], 1, size - i, file));
     i += read;
   }
   fclose(file);
@@ -357,8 +357,8 @@ v8::Handle<v8::String> ReadFile(const char* name) {
 }
 
 
-void ReportException(v8::TryCatch* try_catch) {
-  v8::HandleScope handle_scope;
+void ReportException(v8::Isolate* isolate, v8::TryCatch* try_catch) {
+  v8::HandleScope handle_scope(isolate);
   v8::String::Utf8Value exception(try_catch->Exception());
   const char* exception_string = ToCString(exception);
   v8::Handle<v8::Message> message = try_catch->Message();
@@ -393,10 +393,10 @@ void ReportException(v8::TryCatch* try_catch) {
 // The callback that is invoked by v8 whenever the JavaScript 'print'
 // function is called.  Prints its arguments on stdout separated by
 // spaces and ending with a newline.
-v8::Handle<v8::Value> Print(const v8::Arguments& args) {
+void Print(const v8::FunctionCallbackInfo<v8::Value>& args) {
   bool first = true;
   for (int i = 0; i < args.Length(); i++) {
-    v8::HandleScope handle_scope;
+    v8::HandleScope handle_scope(args.GetIsolate());
     if (first) {
       first = false;
     } else {
@@ -408,17 +408,17 @@ v8::Handle<v8::Value> Print(const v8::Arguments& args) {
   }
   printf("\n");
   fflush(stdout);
-  return v8::Undefined();
 }
 
 
 // The callback that is invoked by v8 whenever the JavaScript 'read_line'
 // function is called. Reads a string from standard input and returns.
-v8::Handle<v8::Value> ReadLine(const v8::Arguments& args) {
+void ReadLine(const v8::FunctionCallbackInfo<v8::Value>& args) {
   if (args.Length() > 0) {
-    return v8::ThrowException(v8::String::New("Unexpected arguments"));
+    v8::ThrowException(v8::String::New("Unexpected arguments"));
+    return;
   }
-  return ReadLine();
+  args.GetReturnValue().Set(ReadLine());
 }
 
 v8::Handle<v8::String> ReadLine() {
@@ -427,14 +427,14 @@ v8::Handle<v8::String> ReadLine() {
 
   char* res;
   {
-#ifdef SUPPORT_DEBUGGING
-    v8::Unlocker unlocker;
-#endif
+#ifdef ENABLE_DEBUGGER_SUPPORT
+    v8::Unlocker unlocker(v8::Isolate::GetCurrent());
+#endif  // ENABLE_DEBUGGER_SUPPORT
     res = fgets(buffer, kBufferSize, stdin);
   }
   if (res == NULL) {
     v8::Handle<v8::Primitive> t = v8::Undefined();
-    return v8::Handle<v8::String>(v8::String::Cast(*t));
+    return v8::Handle<v8::String>::Cast(t);
   }
   // Remove newline char
   for (char* pos = buffer; *pos != '\0'; pos++) {

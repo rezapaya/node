@@ -28,6 +28,12 @@
 
 namespace node {
 
+// Defined in node.cc
+extern v8::Isolate* node_isolate;
+
+// Defined in node.cc at startup.
+extern v8::Persistent<v8::Object> process;
+
 #ifdef _WIN32
 // emulate snprintf() on windows, _snprintf() doesn't zero-terminate the buffer
 // on overflow...
@@ -40,6 +46,12 @@ inline static int snprintf(char* buf, unsigned int len, const char* fmt, ...) {
   va_end(ap);
   return n;
 }
+#endif
+
+#if defined(__x86_64__)
+# define BITS_PER_LONG 64
+#else
+# define BITS_PER_LONG 32
 #endif
 
 #ifndef offset_of
@@ -62,11 +74,17 @@ inline static int snprintf(char* buf, unsigned int len, const char* fmt, ...) {
 # define ROUND_UP(a, b) ((a) % (b) ? ((a) + (b)) - ((a) % (b)) : (a))
 #endif
 
+#if defined(__GNUC__) && __GNUC__ >= 4
+# define MUST_USE_RESULT __attribute__((warn_unused_result))
+#else
+# define MUST_USE_RESULT
+#endif
+
 // this would have been a template function were it not for the fact that g++
 // sometimes fails to resolve it...
 #define THROW_ERROR(fun)                                                      \
   do {                                                                        \
-    v8::HandleScope scope;                                                    \
+    v8::HandleScope scope(node_isolate);                                      \
     return v8::ThrowException(fun(v8::String::New(errmsg)));                  \
   }                                                                           \
   while (0)
@@ -84,15 +102,64 @@ inline static v8::Handle<v8::Value> ThrowRangeError(const char* errmsg) {
 }
 
 #define UNWRAP(type)                                                        \
-  assert(!args.Holder().IsEmpty());                                         \
-  assert(args.Holder()->InternalFieldCount() > 0);                          \
-  type* wrap =                                                              \
-      static_cast<type*>(args.Holder()->GetPointerFromInternalField(0));    \
+  assert(!args.This().IsEmpty());                                           \
+  assert(args.This()->InternalFieldCount() > 0);                            \
+  type* wrap = static_cast<type*>(                                          \
+      args.This()->GetAlignedPointerFromInternalField(0));                  \
   if (!wrap) {                                                              \
     fprintf(stderr, #type ": Aborting due to unwrap failure at %s:%d\n",    \
             __FILE__, __LINE__);                                            \
     abort();                                                                \
   }
+
+v8::Handle<v8::Value> FromConstructorTemplate(
+    v8::Persistent<v8::FunctionTemplate> t,
+    const v8::Arguments& args);
+
+// allow for quick domain check
+extern bool using_domains;
+
+enum Endianness {
+  kLittleEndian,  // _Not_ LITTLE_ENDIAN, clashes with endian.h.
+  kBigEndian
+};
+
+inline enum Endianness GetEndianness() {
+  // Constant-folded by the compiler.
+  const union {
+    uint8_t u8[2];
+    uint16_t u16;
+  } u = {
+    { 1, 0 }
+  };
+  return u.u16 == 1 ? kLittleEndian : kBigEndian;
+}
+
+inline bool IsLittleEndian() {
+  return GetEndianness() == kLittleEndian;
+}
+
+inline bool IsBigEndian() {
+  return GetEndianness() == kBigEndian;
+}
+
+// parse index for external array data
+inline MUST_USE_RESULT bool ParseArrayIndex(v8::Handle<v8::Value> arg,
+                                            size_t def,
+                                            size_t* ret) {
+  if (arg->IsUndefined()) {
+    *ret = def;
+    return true;
+  }
+
+  int32_t tmp_i = arg->Int32Value();
+
+  if (tmp_i < 0)
+    return false;
+
+  *ret = static_cast<size_t>(tmp_i);
+  return true;
+}
 
 } // namespace node
 

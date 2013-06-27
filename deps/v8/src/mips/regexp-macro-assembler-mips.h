@@ -38,13 +38,7 @@
 namespace v8 {
 namespace internal {
 
-#ifdef V8_INTERPRETED_REGEXP
-class RegExpMacroAssemblerMIPS: public RegExpMacroAssembler {
- public:
-  RegExpMacroAssemblerMIPS();
-  virtual ~RegExpMacroAssemblerMIPS();
-};
-#else  // V8_INTERPRETED_REGEXP
+#ifndef V8_INTERPRETED_REGEXP
 class RegExpMacroAssemblerMIPS: public NativeRegExpMacroAssembler {
  public:
   RegExpMacroAssemblerMIPS(Mode mode, int registers_to_save, Zone* zone);
@@ -61,10 +55,6 @@ class RegExpMacroAssemblerMIPS: public NativeRegExpMacroAssembler {
                                       Label* on_equal);
   virtual void CheckCharacterGT(uc16 limit, Label* on_greater);
   virtual void CheckCharacterLT(uc16 limit, Label* on_less);
-  virtual void CheckCharacters(Vector<const uc16> str,
-                               int cp_offset,
-                               Label* on_failure,
-                               bool check_end_of_string);
   // A "greedy loop" is a loop that is both greedy and with a simple
   // body. It has a particularly simple implementation.
   virtual void CheckGreedyLoop(Label* on_tos_equals_current_position);
@@ -118,6 +108,7 @@ class RegExpMacroAssemblerMIPS: public NativeRegExpMacroAssembler {
   virtual void WriteCurrentPositionToRegister(int reg, int cp_offset);
   virtual void ClearRegisters(int reg_from, int reg_to);
   virtual void WriteStackPointerToRegister(int reg);
+  virtual bool CanReadUnaligned();
 
   // Called from RegExp if the stack-guard is triggered.
   // If the code object is relocated, the return address is fixed before
@@ -234,6 +225,7 @@ class RegExpMacroAssemblerMIPS: public NativeRegExpMacroAssembler {
   inline void CallCFunctionUsingStub(ExternalReference function,
                                      int num_arguments);
 
+  Isolate* isolate() const { return masm_->isolate(); }
 
   MacroAssembler* masm_;
 

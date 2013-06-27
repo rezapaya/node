@@ -25,25 +25,26 @@
 #include "handle_wrap.h"
 #include "stream_wrap.h"
 #include "pipe_wrap.h"
+#include "node_wrap.h"
 
 namespace node {
 
-using v8::Object;
-using v8::Handle;
-using v8::Local;
-using v8::Persistent;
-using v8::Value;
-using v8::HandleScope;
-using v8::FunctionTemplate;
-using v8::String;
-using v8::Function;
-using v8::TryCatch;
-using v8::Context;
 using v8::Arguments;
-using v8::Integer;
 using v8::Boolean;
+using v8::Function;
+using v8::FunctionTemplate;
+using v8::Handle;
+using v8::HandleScope;
+using v8::Integer;
+using v8::Local;
+using v8::Object;
+using v8::Persistent;
+using v8::PropertyAttribute;
+using v8::String;
+using v8::Value;
 
-Persistent<Function> pipeConstructor;
+extern Persistent<FunctionTemplate> pipeConstructorTmpl;
+static Persistent<Function> pipeConstructor;
 
 static Persistent<String> onconnection_sym;
 static Persistent<String> oncomplete_sym;
@@ -59,7 +60,7 @@ uv_pipe_t* PipeWrap::UVHandle() {
 
 
 Local<Object> PipeWrap::Instantiate() {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
   assert(!pipeConstructor.IsEmpty());
   return scope.Close(pipeConstructor->NewInstance());
 }
@@ -68,22 +69,32 @@ Local<Object> PipeWrap::Instantiate() {
 PipeWrap* PipeWrap::Unwrap(Local<Object> obj) {
   assert(!obj.IsEmpty());
   assert(obj->InternalFieldCount() > 0);
-  return static_cast<PipeWrap*>(obj->GetPointerFromInternalField(0));
+  return static_cast<PipeWrap*>(obj->GetAlignedPointerFromInternalField(0));
 }
 
 
 void PipeWrap::Initialize(Handle<Object> target) {
   StreamWrap::Initialize(target);
 
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   Local<FunctionTemplate> t = FunctionTemplate::New(New);
   t->SetClassName(String::NewSymbol("Pipe"));
 
   t->InstanceTemplate()->SetInternalFieldCount(1);
 
+  enum PropertyAttribute attributes =
+      static_cast<PropertyAttribute>(v8::ReadOnly | v8::DontDelete);
+  t->InstanceTemplate()->SetAccessor(String::New("fd"),
+                                     StreamWrap::GetFD,
+                                     NULL,
+                                     Handle<Value>(),
+                                     v8::DEFAULT,
+                                     attributes);
+
   NODE_SET_PROTOTYPE_METHOD(t, "close", HandleWrap::Close);
   NODE_SET_PROTOTYPE_METHOD(t, "unref", HandleWrap::Unref);
+  NODE_SET_PROTOTYPE_METHOD(t, "ref", HandleWrap::Ref);
 
   NODE_SET_PROTOTYPE_METHOD(t, "readStart", StreamWrap::ReadStart);
   NODE_SET_PROTOTYPE_METHOD(t, "readStop", StreamWrap::ReadStop);
@@ -103,7 +114,8 @@ void PipeWrap::Initialize(Handle<Object> target) {
   NODE_SET_PROTOTYPE_METHOD(t, "setPendingInstances", SetPendingInstances);
 #endif
 
-  pipeConstructor = Persistent<Function>::New(t->GetFunction());
+  pipeConstructorTmpl = Persistent<FunctionTemplate>::New(node_isolate, t);
+  pipeConstructor = Persistent<Function>::New(node_isolate, t->GetFunction());
 
   target->Set(String::NewSymbol("Pipe"), pipeConstructor);
 }
@@ -115,7 +127,7 @@ Handle<Value> PipeWrap::New(const Arguments& args) {
   // normal function.
   assert(args.IsConstructCall());
 
-  HandleScope scope;
+  HandleScope scope(node_isolate);
   PipeWrap* wrap = new PipeWrap(args.This(), args[0]->IsTrue());
   assert(wrap);
 
@@ -124,17 +136,16 @@ Handle<Value> PipeWrap::New(const Arguments& args) {
 
 
 PipeWrap::PipeWrap(Handle<Object> object, bool ipc)
-    : StreamWrap(object, (uv_stream_t*) &handle_) {
+    : StreamWrap(object, reinterpret_cast<uv_stream_t*>(&handle_)) {
   int r = uv_pipe_init(uv_default_loop(), &handle_, ipc);
   assert(r == 0); // How do we proxy this error up to javascript?
                   // Suggestion: uv_pipe_init() returns void.
-  handle_.data = reinterpret_cast<void*>(this);
   UpdateWriteQueueSize();
 }
 
 
 Handle<Value> PipeWrap::Bind(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   UNWRAP(PipeWrap)
 
@@ -145,13 +156,13 @@ Handle<Value> PipeWrap::Bind(const Arguments& args) {
   // Error starting the pipe.
   if (r) SetErrno(uv_last_error(uv_default_loop()));
 
-  return scope.Close(Integer::New(r));
+  return scope.Close(Integer::New(r, node_isolate));
 }
 
 
 #ifdef _WIN32
 Handle<Value> PipeWrap::SetPendingInstances(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   UNWRAP(PipeWrap)
 
@@ -159,33 +170,35 @@ Handle<Value> PipeWrap::SetPendingInstances(const Arguments& args) {
 
   uv_pipe_pending_instances(&wrap->handle_, instances);
 
-  return v8::Null();
+  return v8::Null(node_isolate);
 }
 #endif
 
 
 Handle<Value> PipeWrap::Listen(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   UNWRAP(PipeWrap)
 
   int backlog = args[0]->Int32Value();
 
-  int r = uv_listen((uv_stream_t*)&wrap->handle_, backlog, OnConnection);
+  int r = uv_listen(reinterpret_cast<uv_stream_t*>(&wrap->handle_),
+                    backlog,
+                    OnConnection);
 
   // Error starting the pipe.
   if (r) SetErrno(uv_last_error(uv_default_loop()));
 
-  return scope.Close(Integer::New(r));
+  return scope.Close(Integer::New(r, node_isolate));
 }
 
 
 // TODO maybe share with TCPWrap?
 void PipeWrap::OnConnection(uv_stream_t* handle, int status) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   PipeWrap* wrap = static_cast<PipeWrap*>(handle->data);
-  assert(&wrap->handle_ == (uv_pipe_t*)handle);
+  assert(&wrap->handle_ == reinterpret_cast<uv_pipe_t*>(handle));
 
   // We should not be getting this callback if someone as already called
   // uv_close() on the handle.
@@ -203,9 +216,10 @@ void PipeWrap::OnConnection(uv_stream_t* handle, int status) {
   // Unwrap the client javascript object.
   assert(client_obj->InternalFieldCount() > 0);
   PipeWrap* client_wrap =
-      static_cast<PipeWrap*>(client_obj->GetPointerFromInternalField(0));
-
-  if (uv_accept(handle, (uv_stream_t*)&client_wrap->handle_)) return;
+      static_cast<PipeWrap*>(client_obj->GetAlignedPointerFromInternalField(0));
+  uv_stream_t* client_handle =
+      reinterpret_cast<uv_stream_t*>(&client_wrap->handle_);
+  if (uv_accept(handle, client_handle)) return;
 
   // Successful accept. Call the onconnection callback in JavaScript land.
   Local<Value> argv[1] = { client_obj };
@@ -220,7 +234,7 @@ void PipeWrap::AfterConnect(uv_connect_t* req, int status) {
   ConnectWrap* req_wrap = (ConnectWrap*) req->data;
   PipeWrap* wrap = (PipeWrap*) req->handle->data;
 
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   // The wrap and request objects should still be there.
   assert(req_wrap->object_.IsEmpty() == false);
@@ -237,11 +251,11 @@ void PipeWrap::AfterConnect(uv_connect_t* req, int status) {
   }
 
   Local<Value> argv[5] = {
-    Integer::New(status),
-    Local<Value>::New(wrap->object_),
-    Local<Value>::New(req_wrap->object_),
-    Local<Value>::New(Boolean::New(readable)),
-    Local<Value>::New(Boolean::New(writable))
+    Integer::New(status, node_isolate),
+    Local<Value>::New(node_isolate, wrap->object_),
+    Local<Value>::New(node_isolate, req_wrap->object_),
+    Local<Value>::New(node_isolate, Boolean::New(readable)),
+    Local<Value>::New(node_isolate, Boolean::New(writable))
   };
 
   if (oncomplete_sym.IsEmpty()) {
@@ -254,7 +268,7 @@ void PipeWrap::AfterConnect(uv_connect_t* req, int status) {
 
 
 Handle<Value> PipeWrap::Open(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   UNWRAP(PipeWrap)
 
@@ -262,12 +276,12 @@ Handle<Value> PipeWrap::Open(const Arguments& args) {
 
   uv_pipe_open(&wrap->handle_, fd);
 
-  return scope.Close(v8::Null());
+  return scope.Close(v8::Null(node_isolate));
 }
 
 
 Handle<Value> PipeWrap::Connect(const Arguments& args) {
-  HandleScope scope;
+  HandleScope scope(node_isolate);
 
   UNWRAP(PipeWrap)
 
